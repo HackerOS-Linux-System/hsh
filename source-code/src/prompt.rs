@@ -8,19 +8,7 @@ use sysinfo::System;
 use terminal_size::terminal_size;
 
 use crate::config::get_segment_order;
-
-pub fn get_git_branch() -> Option<String> {
-    let output = std::process::Command::new("git")
-    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-    .stderr(std::process::Stdio::null())
-    .output()
-    .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
+use crate::git_info::GitInfo;
 
 fn is_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -40,46 +28,23 @@ pub fn build_prompt(
     last_duration_ms: Option<u128>,
     shell_depth: usize,
     system: &System,
+    git_info: &GitInfo,
 ) -> String {
-    let time_color = prompt_cfg
-    .get("time_color")
-    .cloned()
-    .unwrap_or("\x1b[1;36m".to_string());
-    let dir_symbol = prompt_cfg
-    .get("dir_symbol")
-    .cloned()
-    .unwrap_or("\u{1F4C1}".to_string());
-    let dir_color = prompt_cfg
-    .get("dir_color")
-    .cloned()
-    .unwrap_or("\x1b[1;34m".to_string());
-    let git_symbol = prompt_cfg
-    .get("git_symbol")
-    .cloned()
-    .unwrap_or("\u{E0A0}".to_string());
-    let git_color = prompt_cfg
-    .get("git_color")
-    .cloned()
-    .unwrap_or("\x1b[1;33m".to_string());
-    let prompt_color = prompt_cfg
-    .get("prompt_color")
-    .cloned()
-    .unwrap_or("\x1b[1;32m".to_string());
-    let error_symbol_str = prompt_cfg
-    .get("error_symbol")
-    .cloned()
-    .unwrap_or("\u{2718}".to_string());
-    let root_symbol_str = prompt_cfg
-    .get("root_symbol")
-    .cloned()
-    .unwrap_or("\u{26A1}".to_string());
+    // ── colours / symbols from config (with defaults) ─────────────────────────
+    let time_color   = prompt_cfg.get("time_color")  .cloned().unwrap_or("\x1b[1;36m".into());
+    let dir_symbol   = prompt_cfg.get("dir_symbol")  .cloned().unwrap_or("\u{1F4C1}".into());
+    let dir_color    = prompt_cfg.get("dir_color")   .cloned().unwrap_or("\x1b[1;34m".into());
+    let git_symbol   = prompt_cfg.get("git_symbol")  .cloned().unwrap_or("\u{E0A0}".into());
+    let git_color    = prompt_cfg.get("git_color")   .cloned().unwrap_or("\x1b[1;33m".into());
+    let prompt_color = prompt_cfg.get("prompt_color").cloned().unwrap_or("\x1b[1;32m".into());
+    let error_sym    = prompt_cfg.get("error_symbol").cloned().unwrap_or("\u{2718}".into());
+    let root_sym     = prompt_cfg.get("root_symbol") .cloned().unwrap_or("\u{26A1}".into());
 
-    let current_dir = env::current_dir().unwrap_or(PathBuf::from("/"));
-    let git_branch = get_git_branch();
-    let time = Local::now().format("%H:%M").to_string();
+    let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let time        = Local::now().format("%H:%M").to_string();
+    let segments    = get_segment_order(prompt_cfg);
 
-    let segments = get_segment_order(prompt_cfg);
-
+    // ── left-side segments ────────────────────────────────────────────────────
     let mut left_parts: Vec<String> = Vec::new();
 
     for seg in &segments {
@@ -90,76 +55,67 @@ pub fn build_prompt(
             "dir" => {
                 left_parts.push(format!(
                     "{}{} {}\x1b[0m",
-                    dir_color,
-                    dir_symbol,
-                    current_dir.display()
+                    dir_color, dir_symbol, current_dir.display()
                 ));
             }
             "git" => {
-                if let Some(ref branch) = git_branch {
-                    left_parts.push(format!(
-                        "{}({} {})\x1b[0m",
-                                            git_color, git_symbol, branch
-                    ));
+                let git_str = git_info.format(&git_symbol, &git_color);
+                if !git_str.is_empty() {
+                    left_parts.push(git_str);
                 }
             }
-            "mem_cpu" => {
-                // handled in right prompt
-            }
+            "mem_cpu" => { /* handled in right prompt */ }
             _ => {}
         }
     }
 
+    // ── right-side: mem / cpu ─────────────────────────────────────────────────
     let used_mem_gb = system.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-    let cpu_usage = system
-    .cpus()
-    .first()
-    .map(|c| c.cpu_usage())
-    .unwrap_or(0.0);
-    let rprompt = format!("mem:{:.1}GB cpu:{:.0}%", used_mem_gb, cpu_usage);
+    let cpu_usage   = system.cpus().first().map(|c| c.cpu_usage()).unwrap_or(0.0);
+    let rprompt     = format!("mem:{:.1}GB cpu:{:.0}%", used_mem_gb, cpu_usage);
 
-    // Depth indicator: shows (()) for subshells
+    // ── subshell depth indicator  (())  ((()))  etc. ──────────────────────────
     let depth_indicator = if shell_depth > 0 {
-        format!(" \x1b[90m{}\x1b[0m", "(".repeat(shell_depth + 1) + &")".repeat(shell_depth + 1))
+        let n = shell_depth + 1;
+        format!(
+            " \x1b[90m{}{}\x1b[0m",
+            "(".repeat(n),
+                ")".repeat(n)
+        )
     } else {
         String::new()
     };
 
-    let left_first_line = format!("╭─ {}{}", left_parts.join(" "), depth_indicator);
+    // ── first line: left + right aligned ──────────────────────────────────────
+    let left_first = format!("╭─ {}{}", left_parts.join(" "), depth_indicator);
+    let left_len   = left_first.ansi_strip().len();
+    let rp_len     = rprompt.len();
+    let term_w     = terminal_size().map(|(w, _)| w.0 as usize).unwrap_or(80);
+    let spaces     = term_w.saturating_sub(left_len + rp_len);
 
-    let left_len = left_first_line.ansi_strip().len();
-    let rprompt_len = rprompt.len();
-    let term_width = terminal_size().map(|(w, _)| w.0 as usize).unwrap_or(80);
-    let spaces = term_width.saturating_sub(left_len + rprompt_len);
+    let first_line = format!("{}{}{}", left_first, " ".repeat(spaces), rprompt);
 
-    let first_line = format!("{}{}{}", left_first_line, " ".repeat(spaces), rprompt);
+    // ── optional duration line ────────────────────────────────────────────────
+    let duration_line = last_duration_ms
+    .map(|ms| format!("  \x1b[90m{}\x1b[0m\n", format_duration(ms)))
+    .unwrap_or_default();
 
-    // Duration line
-    let duration_part = if let Some(ms) = last_duration_ms {
-        format!(" \x1b[90m{}\x1b[0m", format_duration(ms))
+    // ── second line: prompt character ─────────────────────────────────────────
+    let error_part = if last_exit_code != 0 {
+        format!("\x1b[31m{}\x1b[0m ", error_sym)
     } else {
         String::new()
     };
-
-    let error_symbol = if last_exit_code != 0 {
-        format!("\x1b[31m{}\x1b[0m ", error_symbol_str)
-    } else {
-        String::new()
-    };
-    let root_symbol = if is_root() {
-        format!("{} ", root_symbol_str)
+    let root_part = if is_root() {
+        format!("{} ", root_sym)
     } else {
         String::new()
     };
 
     let second_line = format!(
         "{}╰─ {}{}hsh❯\x1b[0m ",
-        prompt_color, error_symbol, root_symbol
+        prompt_color, error_part, root_part
     );
 
-    if duration_part.is_empty() {
-        format!("{}\n{}", first_line, second_line)
-    } else {
-        format!("{}\n{}{}\n{}", first_line, prompt_color, duration_part, second_line)
-    }
+    format!("{}\n{}{}", first_line, duration_line, second_line)
 }
