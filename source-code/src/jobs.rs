@@ -11,21 +11,21 @@ pub enum JobStatus {
 
 #[derive(Debug, Clone)]
 pub struct Job {
-    pub id: usize,
-    pub pid: u32,
+    pub id:      usize,
+    pub pid:     u32,
     pub command: String,
-    pub status: JobStatus,
+    pub status:  JobStatus,
 }
 
 pub struct JobTable {
-    jobs: HashMap<usize, Job>,
+    jobs:    HashMap<usize, Job>,
     next_id: usize,
 }
 
 impl JobTable {
     pub fn new() -> Self {
         JobTable {
-            jobs: HashMap::new(),
+            jobs:    HashMap::new(),
             next_id: 1,
         }
     }
@@ -54,9 +54,9 @@ impl JobTable {
                 let status = match job.status {
                     JobStatus::Running => "Running",
                     JobStatus::Stopped => "Stopped",
-                    JobStatus::Done => "Done",
+                    JobStatus::Done    => "Done",
                 };
-                println!("[{}] {:8} {}  {}", job.id, status, job.pid, job.command);
+                println!("[{}] {:8}  {}  {}", job.id, status, job.pid, job.command);
             }
         }
     }
@@ -80,6 +80,39 @@ impl JobTable {
             kill(Pid::from_raw(job.pid as i32), sig).is_ok()
         } else {
             false
+        }
+    }
+
+    /// Poll all background jobs non-blockingly; print notification for finished ones.
+    pub fn check_finished(&mut self) {
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+        let ids: Vec<usize> = self.jobs.keys().cloned().collect();
+        for id in ids {
+            let pid = match self.jobs.get(&id) {
+                Some(j) => Pid::from_raw(j.pid as i32),
+                None    => continue,
+            };
+
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => {
+                    if let Some(job) = self.jobs.remove(&id) {
+                        println!(
+                            "\n\x1b[1;32m[{}] Done ({})\x1b[0m  {}",
+                                 job.id, code, job.command
+                        );
+                    }
+                }
+                Ok(WaitStatus::Signaled(_, sig, _)) => {
+                    if let Some(job) = self.jobs.remove(&id) {
+                        println!(
+                            "\n\x1b[1;31m[{}] Killed ({})\x1b[0m  {}",
+                                 job.id, sig, job.command
+                        );
+                    }
+                }
+                _ => {} // Still running, or WNOHANG returned "not yet"
+            }
         }
     }
 }
