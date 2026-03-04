@@ -32,7 +32,7 @@ impl ShellHistory {
         }
     }
 
-    /// Add entry, deduplicating consecutive identical commands
+    /// Add entry — deduplicate consecutive identical commands
     pub fn add(&mut self, cmd: &str) {
         if self.entries.last().map(|e| e.command.as_str()) == Some(cmd) {
             return;
@@ -43,7 +43,12 @@ impl ShellHistory {
         });
     }
 
-    /// Print history with timestamps
+    /// Return the command string of the most recent entry
+    pub fn last_command(&self) -> Option<String> {
+        self.entries.last().map(|e| e.command.clone())
+    }
+
+    /// Print all entries with timestamps (newest first, max 500)
     pub fn print_all(&self) {
         for (i, entry) in self.entries.iter().enumerate().rev().take(500) {
             println!(
@@ -55,12 +60,12 @@ impl ShellHistory {
         }
     }
 
-    /// Fuzzy search using fuzzy-matcher
+    /// Fuzzy search — returns deduplicated results sorted by score
     pub fn fuzzy_search(&self, query: &str) -> Vec<&HistoryEntry> {
-        use fuzzy_matcher::FuzzyMatcher;
         use fuzzy_matcher::skim::SkimMatcherV2;
-        let matcher = SkimMatcherV2::default();
+        use fuzzy_matcher::FuzzyMatcher;
 
+        let matcher = SkimMatcherV2::default();
         let mut scored: Vec<(i64, &HistoryEntry)> = self
         .entries
         .iter()
@@ -72,7 +77,7 @@ impl ShellHistory {
         .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0));
-        // Deduplicate by command
+
         let mut seen = HashSet::new();
         scored
         .into_iter()
