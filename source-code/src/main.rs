@@ -1,6 +1,8 @@
+mod arithmetic;
 mod builtins;
 mod builtins_native;
 mod config;
+mod docs;
 mod execute;
 mod git_info;
 mod helper;
@@ -8,8 +10,12 @@ mod history;
 mod jobs;
 mod path_cache;
 mod prompt;
+mod redirect;
+mod script;
 mod security;
+mod settings;
 mod smarthints;
+mod theme;
 mod vars;
 
 use std::env;
@@ -27,54 +33,53 @@ use helper::ShellHelper;
 use history::ShellHistory;
 use jobs::JobTable;
 use path_cache::PathCache;
+use settings::run_settings;
 use smarthints::SmartHints;
+use theme::Theme;
 use vars::ShellVars;
 
 #[tokio::main]
 async fn main() -> rustyline::Result<()> {
-    // ── CLI argument parsing ──────────────────────────────────────────────────
     let args: Vec<String> = env::args().collect();
     let dry_run = args.contains(&"--dry-run".to_string());
 
-    // hsh -c "command" — non-interactive single-command execution
+    // ── hsh --version ────────────────────────────────────────────────────────
+    if args.contains(&"--version".to_string()) || args.contains(&"-V".to_string()) {
+        println!("hsh 0.2.0 — HackerOS Shell");
+        println!("License: BSD-3-Clause");
+        std::process::exit(0);
+    }
+
+    // ── hsh -c "command" ────────────────────────────────────────────────────
     if let Some(pos) = args.iter().position(|a| a == "-c") {
         match args.get(pos + 1) {
             Some(cmd) => {
                 let home      = env::var("HOME").unwrap_or_default();
                 let hk_config = load_shell_config();
                 let aliases   = config::get_aliases(&hk_config);
-
-                let mut prev_dir = None::<PathBuf>;
-                let mut jobs     = JobTable::new();
-                let mut vars     = ShellVars::new();
-                let mut hints    = SmartHints::load(&format!("{}/.hsh-hints.json", home));
-                let mut history  = ShellHistory::load(&format!("{}/.hsh-history-ts.json", home));
-                let path_cache   = PathCache::new(&format!("{}/.hsh-path-cache.json", home));
-
+                let mut prev_dir  = None::<PathBuf>;
+                let mut jobs      = JobTable::new();
+                let mut vars      = ShellVars::new();
+                let mut hints     = SmartHints::load(&format!("{}/.hsh-hints.json",        home));
+                let mut history   = ShellHistory::load(&format!("{}/.hsh-history-ts.json", home));
+                let path_cache    = PathCache::new(&format!("{}/.hsh-path-cache.json",     home));
                 let mut rl: Editor<ShellHelper, rustyline::history::FileHistory> =
                 Editor::with_config(Config::builder().build())?;
-                rl.set_helper(Some(ShellHelper::new()));
-
+                rl.set_helper(Some(ShellHelper::new(Theme::load())));
                 let code = execute_command(
                     cmd, &aliases, &mut rl, &mut prev_dir,
                     &mut jobs, &mut vars, &mut hints, &mut history,
                     &path_cache, dry_run,
-                )
-                .await
-                .unwrap_or(1);
-
-                hints.save(&format!("{}/.hsh-hints.json", home));
+                ).await.unwrap_or(1);
+                hints.save(&format!("{}/.hsh-hints.json",        home));
                 history.save(&format!("{}/.hsh-history-ts.json", home));
                 std::process::exit(code);
             }
-            None => {
-                eprintln!("hsh: -c requires an argument");
-                std::process::exit(1);
-            }
+            None => { eprintln!("hsh: -c requires an argument"); std::process::exit(1); }
         }
     }
 
-    // ── MOTD (optional, non-fatal) ────────────────────────────────────────────
+    // ── MOTD ─────────────────────────────────────────────────────────────────
     if let Ok(mut child) = TokioCommand::new("sh")
         .arg("-c")
         .arg("/usr/share/HackerOS/Archived/MOTD/hackeros-motd")
@@ -84,17 +89,16 @@ async fn main() -> rustyline::Result<()> {
             let _ = child.wait().await;
         }
 
-        // ── Paths ─────────────────────────────────────────────────────────────────
+        // ── Paths ────────────────────────────────────────────────────────────────
         let home            = env::var("HOME").unwrap_or_default();
     let history_rl_path = format!("{}/.hsh-history",          home);
     let history_ts_path = format!("{}/.hsh-history-ts.json",  home);
-    let hints_path      = format!("{}/.hsh-hints.json",       home);
-    let path_cache_path = format!("{}/.hsh-path-cache.json",  home);
+    let hints_path      = format!("{}/.hsh-hints.json",        home);
+    let path_cache_path = format!("{}/.hsh-path-cache.json",   home);
 
-    // ── PATH cache ────────────────────────────────────────────────────────────
     let mut path_cache = PathCache::new(&path_cache_path);
 
-    // ── Rustyline ─────────────────────────────────────────────────────────────
+    // ── Rustyline ────────────────────────────────────────────────────────────
     let rl_config = Config::builder()
     .history_ignore_space(true)
     .completion_type(CompletionType::List)
@@ -103,16 +107,16 @@ async fn main() -> rustyline::Result<()> {
 
     let mut rl: Editor<ShellHelper, rustyline::history::FileHistory> =
     Editor::with_config(rl_config)?;
-    rl.set_helper(Some(ShellHelper::new()));
+    rl.set_helper(Some(ShellHelper::new(Theme::load())));
     rl.bind_sequence(KeyEvent::ctrl('l'), Cmd::ClearScreen);
     let _ = rl.load_history(&history_rl_path);
 
-    // ── Config ────────────────────────────────────────────────────────────────
+    // ── Config ───────────────────────────────────────────────────────────────
     let hk_config  = load_shell_config();
     let aliases    = config::get_aliases(&hk_config);
     let prompt_cfg = config::get_prompt_config(&hk_config);
 
-    // ── State ─────────────────────────────────────────────────────────────────
+    // ── State ────────────────────────────────────────────────────────────────
     let mut prev_dir         = None::<PathBuf>;
     let mut last_exit_code   = 0i32;
     let mut last_duration_ms = None::<u128>;
@@ -121,26 +125,23 @@ async fn main() -> rustyline::Result<()> {
     let mut shell_history    = ShellHistory::load(&history_ts_path);
     let mut smart_hints      = SmartHints::load(&hints_path);
 
-    // ── Async git watcher ─────────────────────────────────────────────────────
     let git_rx = spawn_git_watcher();
 
-    // ── sysinfo ───────────────────────────────────────────────────────────────
     let mut system = System::new_with_specifics(
         RefreshKind::new()
         .with_memory(MemoryRefreshKind::everything())
         .with_cpu(CpuRefreshKind::everything()),
     );
 
-    // ── Subshell depth ────────────────────────────────────────────────────────
     let shell_depth: usize = env::var("HSH_DEPTH")
     .ok()
     .and_then(|v| v.parse().ok())
     .unwrap_or(0);
     env::set_var("HSH_DEPTH", (shell_depth + 1).to_string());
 
-    // ═════════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════════
     // REPL
-    // ═════════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════════
     loop {
         system.refresh_memory();
         system.refresh_cpu_usage();
@@ -157,24 +158,41 @@ async fn main() -> rustyline::Result<()> {
             &git_info,
         );
 
-        rl.helper_mut().expect("no helper").colored_prompt = prompt.clone();
-
-        // Smart next-command hint
+        // ── Helper state przed readline ───────────────────────────────────
         {
-            let hint_str = shell_history
+            let h = rl.helper_mut().expect("no helper");
+            h.colored_prompt = prompt.clone();
+
+            // Synchronizuj snapshot z SmartHints (podpowiedzi inline)
+            h.sync_hints(&smart_hints);
+
+            // Next-command hint na pustej linii
+            h.next_hint = shell_history
             .last_command()
             .and_then(|last| {
                 smart_hints
                 .suggest_next(&last)
-                .map(|s| format!(" [next: {}]", s))
+                .map(|s| format!("\x1b[38;5;236m{}\x1b[0m", s))
             });
-            rl.helper_mut().expect("no helper").next_hint = hint_str;
         }
 
         match rl.readline(&prompt) {
             Ok(line) => {
                 let trimmed = line.trim();
-                if trimmed.is_empty() {
+                if trimmed.is_empty() { continue; }
+
+                // ── Specjalne komendy meta ────────────────────────────────
+                if trimmed == "hsh-settings" {
+                    run_settings();
+                    let new_theme = Theme::load();
+                    rl.helper_mut().expect("no helper").theme = new_theme;
+                    continue;
+                }
+
+                if trimmed == "hsh-docs" || trimmed.starts_with("hsh-docs ") {
+                    let rest = trimmed.strip_prefix("hsh-docs").unwrap_or("").trim();
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    docs::run_docs(&parts);
                     continue;
                 }
 
@@ -183,6 +201,12 @@ async fn main() -> rustyline::Result<()> {
                 let prev_cmd = shell_history.last_command().unwrap_or_default();
                 shell_history.add(trimmed);
                 smart_hints.record(&prev_cmd, trimmed);
+
+                // ── Sync hints po komendzie ───────────────────────────────
+                {
+                    let h = rl.helper_mut().expect("no helper");
+                    h.sync_hints(&smart_hints);
+                }
 
                 let t0 = std::time::Instant::now();
 
@@ -194,12 +218,13 @@ async fn main() -> rustyline::Result<()> {
                 .await
                 .unwrap_or(1);
 
+                vars.last_exit = last_exit_code;
+
                 last_duration_ms = {
                     let ms = t0.elapsed().as_millis();
                     if ms >= 2000 { Some(ms) } else { None }
                 };
 
-                // Spellcheck on "command not found"
                 if last_exit_code == 127 {
                     let first_word = trimmed.split_whitespace().next().unwrap_or("");
                     if let Some(suggestion) =
@@ -207,7 +232,7 @@ async fn main() -> rustyline::Result<()> {
                         {
                             let corrected = trimmed.replacen(first_word, suggestion, 1);
                             eprintln!(
-                                "\x1b[1;33m❓ Did you mean: \x1b[1;32m{}\x1b[0m\x1b[1;33m?\x1b[0m",
+                                "  \x1b[38;5;220m❓ Czy chodziło Ci o: \x1b[1m{}\x1b[0m\x1b[38;5;220m?\x1b[0m",
                                 corrected
                             );
                         }
@@ -216,10 +241,14 @@ async fn main() -> rustyline::Result<()> {
                 jobs.check_finished();
             }
 
-            Err(ReadlineError::Interrupted) => println!("^C"),
+            Err(ReadlineError::Interrupted) => {
+                vars.last_exit   = 130;
+                last_exit_code   = 130;
+                last_duration_ms = None;
+            }
 
             Err(ReadlineError::Eof) => {
-                println!("exit");
+                eprintln!("\x1b[38;5;244mexit\x1b[0m");
                 break;
             }
 
