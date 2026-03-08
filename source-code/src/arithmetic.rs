@@ -1,9 +1,3 @@
-// SPDX-License-Identifier: BSD-3-Clause
-// Copyright (c) 2025 Michał. All rights reserved.
-//
-// Natywna arytmetyka powłoki: $(( wyrażenie ))
-// Obsługuje: + - * / % ** ( ) zmienne porównania logiczne
-
 use std::collections::HashMap;
 
 #[derive(Debug)]
