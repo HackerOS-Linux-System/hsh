@@ -48,6 +48,90 @@ pub async fn execute_command(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Heredoc extraction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract heredoc bodies from a multi-line string.
+/// Returns (clean_command_without_heredoc_lines, map<delimiter, body>)
+pub fn extract_heredocs(input: &str, vars: &ShellVars) -> (String, HashMap<String, String>) {
+    let mut result = String::new();
+    let mut heredocs = HashMap::new();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        // Look for "<<", possibly with hyphen and quoted delimiter
+        if let Some(pos) = line.find("<<") {
+            let after = &line[pos+2..];
+            let mut chars = after.chars().peekable();
+            let mut delim = String::new();
+            let mut strip_tabs = false;
+
+            // Check for hyphen (strip tabs)
+            if chars.peek() == Some(&'-') {
+                strip_tabs = true;
+                chars.next();
+            }
+            // Skip whitespace
+            while let Some(c) = chars.peek() {
+                if c.is_whitespace() { chars.next(); } else { break; }
+            }
+
+            // Parse delimiter (may be quoted)
+            let quote = chars.peek().copied();
+            if quote == Some('"') || quote == Some('\'') {
+                chars.next(); // skip quote
+                while let Some(c) = chars.next() {
+                    if c == quote.unwrap() { break; }
+                    delim.push(c);
+                }
+            } else {
+                while let Some(c) = chars.next() {
+                    if c.is_whitespace() || c == ';' || c == '\n' { break; }
+                    delim.push(c);
+                }
+            }
+
+            if delim.is_empty() {
+                eprintln!("hsh: missing heredoc delimiter");
+                result.push_str(line);
+                result.push('\n');
+                i += 1;
+                continue;
+            }
+
+            // Collect body until line equals delimiter
+            let mut body = String::new();
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i];
+                let trimmed = l.trim();
+                if trimmed == delim {
+                    i += 1;
+                    break;
+                }
+                let line_to_add = if strip_tabs {
+                    l.strip_prefix('\t').unwrap_or(l)
+                } else {
+                    l
+                };
+                body.push_str(&vars.expand_in_heredoc(line_to_add));
+                body.push('\n');
+                i += 1;
+            }
+            heredocs.insert(delim, body);
+            // Do NOT add the line with "<<" to clean command (it's removed)
+        } else {
+            result.push_str(line);
+            result.push('\n');
+            i += 1;
+        }
+    }
+    (result.trim_end().to_string(), heredocs)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Statement-level runner  (;  &&  ||)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -69,6 +153,10 @@ async fn run_line(
         return Ok(0);
     }
 
+    if vars.xtrace {
+        eprintln!("+ {}", trimmed);
+    }
+
     if is_script_construct(trimmed) {
         return run_script_node(
             trimmed, aliases, rl, prev_dir, jobs, vars,
@@ -80,11 +168,15 @@ async fn run_line(
     let stmts = split_compound(trimmed);
 
     if stmts.len() == 1 {
-        return run_single(
+        let code = run_single(
             trimmed, aliases, rl, prev_dir, jobs, vars,
             smart_hints, shell_history, path_cache, functions, dry_run,
         )
-        .await;
+        .await?;
+        if vars.errexit && code != 0 {
+            return Ok(code);
+        }
+        return Ok(code);
     }
 
     let mut last_code = 0i32;
@@ -97,6 +189,10 @@ async fn run_line(
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
         .await?;
+
+        if vars.errexit && last_code != 0 {
+            return Ok(last_code);
+        }
 
         match op.as_deref() {
             Some("&&") if last_code != 0 => break,
@@ -133,6 +229,7 @@ async fn run_script_node(
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
         .await?;
+        if vars.errexit && last != 0 { break; }
     }
     Ok(last)
 }
@@ -171,6 +268,7 @@ async fn exec_node(
                     smart_hints, shell_history, path_cache, functions, dry_run,
                 ))
                 .await?;
+                if vars.errexit && last != 0 { break; }
             }
             Ok(last)
         }
@@ -217,6 +315,7 @@ async fn exec_node(
                 if cond != 0 { break; }
                 last = run_nodes(body, aliases, rl, prev_dir, jobs, vars,
                                  smart_hints, shell_history, path_cache, functions, dry_run).await?;
+                                 if vars.errexit && last != 0 { break; }
             }
             Ok(last)
         }
@@ -229,6 +328,7 @@ async fn exec_node(
                 env::set_var(var, item);
                 last = run_nodes(body, aliases, rl, prev_dir, jobs, vars,
                                  smart_hints, shell_history, path_cache, functions, dry_run).await?;
+                                 if vars.errexit && last != 0 { break; }
             }
             Ok(last)
         }
@@ -273,6 +373,7 @@ async fn run_nodes(
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
         .await?;
+        if vars.errexit && last != 0 { break; }
     }
     Ok(last)
 }
@@ -301,8 +402,11 @@ async fn run_single(
     let expanded = expand_arithmetic(&expanded, &all_vars);
     let input    = expanded.as_str();
 
-    // 2. source / .
-    if let Some(path) = strip_source_prefix(input) {
+    // 2. Heredoc extraction
+    let (input_without_heredoc, heredoc_bodies) = extract_heredocs(input, vars);
+
+    // 3. source / .
+    if let Some(path) = strip_source_prefix(&input_without_heredoc) {
         let path = expand_tilde(&path);
         if dry_run { println!("[dry-run] source {}", path); return Ok(0); }
         return run_source(
@@ -311,24 +415,24 @@ async fn run_single(
         ).await;
     }
 
-    // 3. Shell builtins
+    // 4. Shell builtins
     if let Some(code) = handle_builtin(
-        input, rl, prev_dir, jobs, shell_history, aliases, dry_run,
+        &input_without_heredoc, rl, prev_dir, jobs, shell_history, aliases, dry_run, vars, &heredoc_bodies,
     ) {
         return Ok(code);
     }
 
-    // 4. test / [ ]
+    // 5. test / [ ]
     {
-        let parts: Vec<String> = shlex::split(input).unwrap_or_default();
+        let parts: Vec<String> = shlex::split(&input_without_heredoc).unwrap_or_default();
         if matches!(parts.first().map(|s| s.as_str()), Some("test") | Some("[")) {
             return Ok(builtin_test(&parts));
         }
     }
 
-    // 5. User-defined functions
+    // 6. User-defined functions
     {
-        let parts: Vec<String> = shlex::split(input).unwrap_or_default();
+        let parts: Vec<String> = shlex::split(&input_without_heredoc).unwrap_or_default();
         if let Some(fname) = parts.first() {
             if functions.contains(fname) {
                 let body = functions.get(fname).cloned().unwrap_or_default();
@@ -342,46 +446,49 @@ async fn run_single(
         }
     }
 
-    // 6. Inline env assignments
-    let (inline_env, rest) = parse_inline_env(input);
+    // 7. Inline env assignments
+    let (inline_env, rest) = parse_inline_env(&input_without_heredoc);
     if rest.is_empty() {
         for (k, v) in &inline_env { vars.set(k, v); env::set_var(k, v); }
         return Ok(0);
     }
 
-    // 7. Alias expansion
+    // 8. Alias expansion
     let rest = expand_alias(&rest, aliases);
 
-    // 8. Auto-sudo
+    // 9. Auto-sudo
     let rest = check_auto_sudo(&rest);
 
-    // 9. Dangerous command guard
+    // 10. Dangerous command guard
     if !dry_run && !confirm_dangerous(&rest) {
         println!("Command aborted.");
         return Ok(1);
     }
 
-    // 10. Background flag
+    // 11. Background flag
     let (background, rest) = strip_background_flag(&rest);
     let rest = rest.trim().to_string();
 
-    // 11. .sh chmod  /  .hl rewrite
+    // 12. .sh chmod  /  .hl rewrite
     maybe_chmod(&rest);
     let rest = maybe_hl_run(rest);
 
-    // 12. Dry-run
+    // 13. Dry-run
     if dry_run {
         println!("[dry-run]{} {}", if background { " [bg]" } else { "" }, rest);
         return Ok(0);
     }
 
-    // 13. Pipeline or simple
+    // 14. Pipeline or simple
     let stages = split_pipeline(&rest);
-    if stages.len() == 1 {
-        run_simple(&rest, &inline_env, jobs, background).await
+    let code = if stages.len() == 1 {
+        run_simple(&rest, &inline_env, jobs, background, vars, &heredoc_bodies).await
     } else {
-        run_pipeline(&stages, &inline_env, jobs, background).await
-    }
+        run_pipeline(&stages, &inline_env, jobs, background, vars, &heredoc_bodies).await
+    }?;
+
+    vars.last_exit = code;
+    Ok(code)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -393,10 +500,11 @@ async fn run_simple(
     inline_env: &[(String, String)],
                     jobs: &mut JobTable,
                     background: bool,
+                    vars: &mut ShellVars,
+                    heredoc_bodies: &HashMap<String, String>,
 ) -> io::Result<i32> {
 
     let (clean_cmd, redirects) = parse_redirections(cmd);
-    let heredoc_bodies: HashMap<String, String> = HashMap::new();
 
     let raw: Vec<String> = shlex::split(&clean_cmd).unwrap_or_default();
     if raw.is_empty() { return Ok(0); }
@@ -406,16 +514,16 @@ async fn run_simple(
 
     // Native builtins (no process spawn needed)
     if let Some(code) = dispatch_native(&program, &argv) {
+        vars.last_exit = code;
         return Ok(code);
     }
-
-    // Build std::process::Command (need pre_exec for redirections)
-    let redirects_for_child: Vec<Redirect> = redirects;
-    let heredocs_for_child: HashMap<String, String> = heredoc_bodies;
 
     let mut builder = std::process::Command::new(&program);
     builder.args(&argv);
     for (k, v) in inline_env { builder.env(k, v); }
+
+    let redirects_for_child: Vec<Redirect> = redirects;
+    let heredocs_for_child = heredoc_bodies.clone();
 
     if !redirects_for_child.is_empty() {
         let r = redirects_for_child.clone();
@@ -435,15 +543,19 @@ async fn run_simple(
                 Ok(0)
             } else {
                 let status = child.wait()?;
-                Ok(status.code().unwrap_or(1))
+                let code = status.code().unwrap_or(1);
+                vars.last_exit = code;
+                Ok(code)
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             eprintln!("hsh: {}: command not found", program);
+            vars.last_exit = 127;
             Ok(127)
         }
         Err(e) => {
             eprintln!("hsh: {}: {}", program, e);
+            vars.last_exit = 1;
             Ok(1)
         }
     }
@@ -458,10 +570,12 @@ async fn run_pipeline(
     inline_env: &[(String, String)],
                       jobs: &mut JobTable,
                       background: bool,
+                      vars: &mut ShellVars,
+                      heredoc_bodies: &HashMap<String, String>,
 ) -> io::Result<i32> {
     if stages.is_empty() { return Ok(0); }
     if stages.len() == 1 {
-        return run_simple(&stages[0], inline_env, jobs, background).await;
+        return run_simple(&stages[0], inline_env, jobs, background, vars, heredoc_bodies).await;
     }
 
     let mut children: Vec<std::process::Child> = Vec::with_capacity(stages.len());
@@ -472,7 +586,6 @@ async fn run_pipeline(
         let is_first = i == 0;
 
         let (clean_stage, redirects) = parse_redirections(stage);
-        let heredoc_bodies: HashMap<String, String> = HashMap::new();
 
         let stdin_cfg: Stdio = prev_stdout.take()
         .map(Stdio::from)
@@ -484,7 +597,7 @@ async fn run_pipeline(
         if parts.is_empty() { continue; }
 
         let redirects_for_child: Vec<Redirect> = redirects;
-        let heredocs_for_child: HashMap<String, String> = heredoc_bodies;
+        let heredocs_for_child = heredoc_bodies.clone();
 
         let mut cmd = std::process::Command::new(&parts[0]);
         cmd.args(&parts[1..]).stdin(stdin_cfg).stdout(stdout_cfg);
@@ -504,9 +617,14 @@ async fn run_pipeline(
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 eprintln!("hsh: {}: command not found", &parts[0]);
+                vars.last_exit = 127;
                 return Ok(127);
             }
-            Err(e) => { eprintln!("hsh: {}: {}", &parts[0], e); return Ok(1); }
+            Err(e) => {
+                eprintln!("hsh: {}: {}", &parts[0], e);
+                vars.last_exit = 1;
+                return Ok(1);
+            }
         };
 
         if !is_last { prev_stdout = child.stdout.take(); }
@@ -527,6 +645,7 @@ async fn run_pipeline(
             Err(e) => eprintln!("hsh: wait: {}", e),
         }
     }
+    vars.last_exit = last_code;
     Ok(last_code)
 }
 
@@ -560,6 +679,7 @@ async fn run_source(
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
         .await?;
+        if vars.errexit && last_code != 0 { break; }
     }
     Ok(last_code)
 }
@@ -770,7 +890,6 @@ fn glob_match(pattern: &str, word: &str) -> bool {
 fn match_glob(pat: &[char], pi: usize, s: &[char], si: usize) -> bool {
     if pi == pat.len() { return si == s.len(); }
     if pat[pi] == '*' {
-        // Skip consecutive stars
         let next_pi = {
             let mut np = pi + 1;
             while np < pat.len() && pat[np] == '*' { np += 1; }
