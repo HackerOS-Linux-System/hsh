@@ -1,6 +1,6 @@
 [package]
 name = "hsh"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -20,3 +20,7 @@ serde_json = "1.0"
 fuzzy-matcher = "0.3"
 glob = "0.3"
 nix = { version = "0.27", features = ["process", "signal"] }
+rand = "0.8"
+walkdir = "2.4"
+syntect = "5.0"
+regex = "1.10"   # NEW
