@@ -45,7 +45,7 @@ async fn main() -> rustyline::Result<()> {
 
     // ── hsh --version ────────────────────────────────────────────────────────
     if args.contains(&"--version".to_string()) || args.contains(&"-V".to_string()) {
-        println!("hsh 0.2.0 — HackerOS Shell");
+        println!("hsh 0.3.5 — HackerOS Shell");
         println!("License: BSD-3-Clause");
         std::process::exit(0);
     }
@@ -109,6 +109,8 @@ async fn main() -> rustyline::Result<()> {
     Editor::with_config(rl_config)?;
     rl.set_helper(Some(ShellHelper::new(Theme::load())));
     rl.bind_sequence(KeyEvent::ctrl('l'), Cmd::ClearScreen);
+    // włączenie Ctrl+R (domyślnie działa, ale dla pewności)
+    rl.bind_sequence(KeyEvent::ctrl('r'), Cmd::HistorySearchForward);
     let _ = rl.load_history(&history_rl_path);
 
     // ── Config ───────────────────────────────────────────────────────────────
@@ -124,6 +126,9 @@ async fn main() -> rustyline::Result<()> {
     let mut vars             = ShellVars::new();
     let mut shell_history    = ShellHistory::load(&history_ts_path);
     let mut smart_hints      = SmartHints::load(&hints_path);
+
+    // ustaw PWD na start
+    vars.set_pwd();
 
     let git_rx = spawn_git_watcher();
 
