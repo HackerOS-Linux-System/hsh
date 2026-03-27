@@ -1,19 +1,34 @@
 use std::collections::HashMap;
 use std::env;
 use std::process::Command;
+use std::time::{Duration, Instant};
+use rand::Rng;
 
 pub struct ShellVars {
-    local:         HashMap<String, String>,
-    pub last_exit: i32,
-    pub positional: Vec<String>,
+    pub local:         HashMap<String, String>,
+    pub last_exit:     i32,
+    pub positional:    Vec<String>,
+    // NEW
+    pub errexit:       bool,
+    pub xtrace:        bool,
+    pub nounset:       bool,
+    pub start_time:    Instant,
+    pub line_no:       usize,
+    pub dir_stack:     Vec<String>,   // dla pushd/popd
 }
 
 impl ShellVars {
     pub fn new() -> Self {
         ShellVars {
-            local:      HashMap::new(),
-            last_exit:  0,
-            positional: Vec::new(),
+            local:        HashMap::new(),
+            last_exit:    0,
+            positional:   Vec::new(),
+            errexit:      false,
+            xtrace:       false,
+            nounset:      false,
+            start_time:   Instant::now(),
+            line_no:      0,
+            dir_stack:    Vec::new(),
         }
     }
 
@@ -30,7 +45,15 @@ impl ShellVars {
             "#"  => return Some(self.positional.len().to_string()),
             "@"  => return Some(self.positional.join(" ")),
             "*"  => return Some(self.positional.join(" ")),
-            _    => {}
+            "RANDOM" => return Some(rand::thread_rng().gen::<u32>().to_string()),
+            "SECONDS" => {
+                let elapsed = self.start_time.elapsed().as_secs();
+                return Some(elapsed.to_string());
+            }
+            "PWD" => return Some(env::current_dir().unwrap_or_default().to_string_lossy().to_string()),
+            "OLDPWD" => return self.local.get("OLDPWD").cloned(),
+            "LINENO" => return Some(self.line_no.to_string()),
+            _ => {}
         }
 
         // Positional $1 $2 ...
@@ -55,6 +78,14 @@ impl ShellVars {
         map.insert("0".to_string(),  "hsh".to_string());
         map.insert("#".to_string(),  self.positional.len().to_string());
         map.insert("@".to_string(),  self.positional.join(" "));
+        map.insert("RANDOM".to_string(), rand::thread_rng().gen::<u32>().to_string());
+        let secs = self.start_time.elapsed().as_secs().to_string();
+        map.insert("SECONDS".to_string(), secs);
+        map.insert("PWD".to_string(), env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+        if let Some(old) = self.local.get("OLDPWD") {
+            map.insert("OLDPWD".to_string(), old.clone());
+        }
+        map.insert("LINENO".to_string(), self.line_no.to_string());
         map
     }
 
@@ -197,6 +228,35 @@ impl ShellVars {
                     result.push('$');
                 }
             }
+        }
+        result
+    }
+
+    // NEW: set shell options
+    pub fn set_option(&mut self, name: &str, value: bool) {
+        match name {
+            "errexit" | "e" => self.errexit = value,
+            "xtrace"  | "x" => self.xtrace = value,
+            "nounset" | "u" => self.nounset = value,
+            _ => {}
+        }
+    }
+
+    // NEW: update PWD and OLDPWD after cd
+    pub fn set_pwd(&mut self) {
+        let pwd = env::current_dir().unwrap_or_default().to_string_lossy().to_string();
+        if let Some(old) = self.local.get("PWD") {
+            self.local.insert("OLDPWD".to_string(), old.clone());
+        }
+        self.local.insert("PWD".to_string(), pwd);
+    }
+
+    // NEW: expand variables inside heredoc (simple $VAR and ${VAR})
+    pub fn expand_in_heredoc(&self, s: &str) -> String {
+        let mut result = s.to_string();
+        for (k, v) in &self.local {
+            result = result.replace(&format!("${}", k), v);
+            result = result.replace(&format!("${{{}}}", k), v);
         }
         result
     }
