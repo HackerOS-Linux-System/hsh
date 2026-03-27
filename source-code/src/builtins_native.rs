@@ -1,30 +1,39 @@
 use std::env;
-use std::fs::{self, metadata, read_dir, File};
+use std::fs::{self, read_dir, File};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
 use chrono::{DateTime, Local};
+use walkdir::WalkDir;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{ThemeSet, Style};
+use syntect::parsing::SyntaxSet;
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 pub fn dispatch_native(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
-        "echo"  => Some(native_echo(args)),
-        "pwd"   => Some(native_pwd()),
-        "ls"    => Some(native_ls(args)),
-        "cat"   => Some(native_cat(args)),
-        "mkdir" => Some(native_mkdir(args)),
-        "rm"    => Some(native_rm(args)),
-        "cp"    => Some(native_cp(args)),
-        "mv"    => Some(native_mv(args)),
-        "touch" => Some(native_touch(args)),
-        "env"   => Some(native_env(args)),
-        "grep"  => Some(native_grep(args)),
-        "head"  => Some(native_head(args)),
-        "tail"  => Some(native_tail(args)),
-        "wc"    => Some(native_wc(args)),
-        "true"  => Some(0),
-        "false" => Some(1),
-        "uname" => Some(native_uname(args)),
-        _       => None,
+        "echo"    => Some(native_echo(args)),
+        "pwd"     => Some(native_pwd()),
+        "ls"      => Some(native_ls(args)),
+        "cat"     => Some(native_cat_highlighted(args)),
+        "mkdir"   => Some(native_mkdir(args)),
+        "rm"      => Some(native_rm(args)),
+        "cp"      => Some(native_cp(args)),
+        "mv"      => Some(native_mv(args)),
+        "touch"   => Some(native_touch(args)),
+        "env"     => Some(native_env(args)),
+        "grep"    => Some(native_grep(args)),
+        "head"    => Some(native_head(args)),
+        "tail"    => Some(native_tail(args)),
+        "wc"      => Some(native_wc(args)),
+        "true"    => Some(0),
+        "false"   => Some(1),
+        "uname"   => Some(native_uname(args)),
+        "find"    => Some(native_find(args)),
+        "xargs"   => Some(native_xargs(args)),
+        "printf"  => Some(native_printf(args)),
+        _         => None,
     }
 }
 
@@ -34,7 +43,6 @@ fn native_echo(args: &[String]) -> i32 {
     let no_newline = args.first().map(|a| a == "-n").unwrap_or(false);
     let start = if no_newline { 1 } else { 0 };
     let out = args[start..].join(" ");
-    // Expand \n \t \\ etc.
     let out = interpret_escapes(&out);
     if no_newline {
         print!("{}", out);
@@ -174,44 +182,40 @@ fn entry_color(path: &Path, meta: &std::fs::Metadata) -> &'static str {
     else { "" }
 }
 
-// ── cat ─────────────────────────────────────────────────────────────────────
+// ── cat z kolorowaniem składni ───────────────────────────────────────────────
 
-fn native_cat(args: &[String]) -> i32 {
-    if args.is_empty() {
-        // Read from stdin
+fn native_cat_highlighted(args: &[String]) -> i32 {
+    let files: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(|s| s.as_str()).collect();
+    if files.is_empty() {
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => println!("{}", l),
-                Err(e) => { eprintln!("cat: {}", e); return 1; }
-            }
+        for line in stdin.lines() {
+            println!("{}", line.unwrap());
         }
         return 0;
     }
-    let mut code = 0;
-    let mut number = false;
-    let mut files: Vec<&str> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "-n" => number = true,
-            _    => files.push(arg.as_str()),
-        }
-    }
-    for file in &files {
-        match File::open(file) {
-            Err(e) => { eprintln!("cat: {}: {}", file, e); code = 1; }
-            Ok(f)  => {
-                let reader = BufReader::new(f);
-                for (i, line) in reader.lines().enumerate() {
-                    match line {
-                        Ok(l)  => if number { println!("{:>6}  {}", i + 1, l); } else { println!("{}", l); }
-                        Err(e) => { eprintln!("cat: {}: {}", file, e); code = 1; break; }
-                    }
-                }
+
+    let ps = SyntaxSet::load_defaults_newlines();
+    let ts = ThemeSet::load_defaults();
+    let theme = &ts.themes["base16-ocean.dark"];
+
+    for file in files {
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cat: {}: {}", file, e);
+                continue;
             }
+        };
+        let ext = Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("");
+        let syntax = ps.find_syntax_by_extension(ext).unwrap_or(ps.find_syntax_plain_text());
+        let mut h = HighlightLines::new(syntax, theme);
+        for line in LinesWithEndings::from(&content) {
+            let ranges: Vec<(Style, &str)> = h.highlight_line(line, &ps).unwrap();
+            let escaped = as_24_bit_terminal_escaped(&ranges[..], true);
+            print!("{}", escaped);
         }
     }
-    code
+    0
 }
 
 // ── mkdir ────────────────────────────────────────────────────────────────────
@@ -326,7 +330,6 @@ fn native_touch(args: &[String]) -> i32 {
     let mut code = 0;
     for arg in args.iter().filter(|a| !a.starts_with('-')) {
         let result = if Path::new(arg).exists() {
-            // Update mtime via File::open + set_modified (or just re-write empty content)
             File::options().write(true).open(arg).map(|_| ())
         } else {
             File::create(arg).map(|_| ())
@@ -344,7 +347,6 @@ fn native_env(args: &[String]) -> i32 {
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         for (k, v) in pairs { println!("{}={}", k, v); }
     } else {
-        // env VAR=val command
         let eq_end = args.iter().position(|a| !a.contains('=')).unwrap_or(args.len());
         let env_pairs = &args[..eq_end];
         let cmd_args  = &args[eq_end..];
@@ -397,8 +399,6 @@ fn native_grep(args: &[String]) -> i32 {
 
     let pat = if ignore_case { pattern.to_lowercase() } else { pattern.clone() };
 
-    let mut matched_any = false;
-
     let process_lines = |reader: &mut dyn BufRead, prefix: &str, code: &mut i32| {
         let mut match_count = 0u64;
         for (lineno, line) in reader.lines().enumerate() {
@@ -414,7 +414,6 @@ fn native_grep(args: &[String]) -> i32 {
                     } else {
                         format!("{}{}", prefix, line)
                     };
-                    // Highlight match in red
                     println!("{}", highlight_match(&out, &pattern, ignore_case));
                 }
             }
@@ -480,7 +479,6 @@ fn parse_n_arg(args: &[String], default: usize) -> usize {
         if let Some(stripped) = args[i].strip_prefix("-n") {
             if let Ok(n) = stripped.parse() { return n; }
         }
-        // -5
         if args[i].starts_with('-') {
             if let Ok(n) = args[i][1..].parse::<usize>() { return n; }
         }
@@ -586,12 +584,180 @@ fn native_uname(args: &[String]) -> i32 {
         parts.push(Box::leak(release.into_boxed_str()));
     }
     if all || machine {
-        // Read from /proc/cpuinfo or use nix
         let arch = if cfg!(target_arch = "x86_64")  { "x86_64" }
         else if cfg!(target_arch = "aarch64") { "aarch64" }
         else { "unknown" };
         parts.push(arch);
     }
     println!("{}", parts.join(" "));
+    0
+}
+
+// ── find ─────────────────────────────────────────────────────────────────────
+
+fn native_find(args: &[String]) -> i32 {
+    let mut path = ".";
+    let mut name_pattern: Option<String> = None;
+    let mut file_type: Option<&str> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-name" => {
+                i += 1;
+                name_pattern = args.get(i).cloned();
+            }
+            "-type" => {
+                i += 1;
+                file_type = args.get(i).map(|s| s.as_str());
+            }
+            _ if path == "." => {
+                path = &args[i];
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let walker = WalkDir::new(path).into_iter();
+    for entry in walker.filter_entry(|e| {
+        if let Some(pat) = &name_pattern {
+            let name = e.file_name().to_string_lossy();
+            // proste globowanie bez regex – używamy glob::Pattern zamiast regex
+            if let Ok(pattern) = glob::Pattern::new(&pat) {
+                if !pattern.matches(&name) {
+                    return false;
+                }
+            }
+        }
+        true
+    }) {
+        match entry {
+            Ok(e) => {
+                let meta = e.metadata().ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let is_file = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
+                match file_type {
+                    Some("d") if !is_dir => continue,
+                    Some("f") if !is_file => continue,
+                    _ => {}
+                }
+                println!("{}", e.path().display());
+            }
+            Err(e) => eprintln!("find: {}", e),
+        }
+    }
+    0
+}
+
+// ── xargs ────────────────────────────────────────────────────────────────────
+
+fn native_xargs(args: &[String]) -> i32 {
+    let mut cmd: Vec<String> = vec!["echo".to_string()];
+    let stdin_reader = io::stdin();
+
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-I" {
+            i += 2;
+        } else if args[i].starts_with('-') {
+            i += 1;
+        } else {
+            cmd = args[i..].to_vec();
+            break;
+        }
+    }
+
+    let mut code = 0;
+    for line in stdin_reader.lines() {
+        let line = line.unwrap();
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let mut full_cmd = cmd.clone();
+        for arg in full_cmd.iter_mut() {
+            *arg = arg.replace("{}", line);
+        }
+        let status = std::process::Command::new(&full_cmd[0])
+        .args(&full_cmd[1..])
+        .status();
+        match status {
+            Ok(s) if !s.success() => code = s.code().unwrap_or(1),
+            Err(e) => { eprintln!("xargs: {}", e); code = 1; }
+            _ => {}
+        }
+    }
+    code
+}
+
+// ── printf ───────────────────────────────────────────────────────────────────
+
+fn native_printf(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("printf: missing format string");
+        return 1;
+    }
+    let format = &args[0];
+    let arguments = &args[1..];
+    let mut output = String::new();
+    let mut in_escape = false;
+    let mut in_format = false;
+    let mut arg_idx = 0;
+
+    for c in format.chars() {
+        if in_escape {
+            match c {
+                'n' => output.push('\n'),
+                't' => output.push('\t'),
+                'r' => output.push('\r'),
+                '\\' => output.push('\\'),
+                _ => output.push(c),
+            }
+            in_escape = false;
+            continue;
+        }
+        if c == '\\' {
+            in_escape = true;
+            continue;
+        }
+        if c == '%' {
+            in_format = true;
+            continue;
+        }
+        if in_format {
+            in_format = false;
+            if c == '%' {
+                output.push('%');
+                continue;
+            }
+            let arg = arguments.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
+            arg_idx += 1;
+            match c {
+                's' => output.push_str(arg),
+                'd' | 'i' => {
+                    if let Ok(num) = arg.parse::<i64>() {
+                        output.push_str(&num.to_string());
+                    } else {
+                        output.push_str("0");
+                    }
+                }
+                'f' => {
+                    if let Ok(num) = arg.parse::<f64>() {
+                        output.push_str(&format!("{:.6}", num));
+                    } else {
+                        output.push_str("0.000000");
+                    }
+                }
+                'c' => {
+                    let ch = arg.chars().next().unwrap_or(' ');
+                    output.push(ch);
+                }
+                _ => output.push(c),
+            }
+        } else {
+            output.push(c);
+        }
+    }
+    print!("{}", output);
+    io::stdout().flush().ok();
     0
 }
