@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::io::IntoRawFd;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{IntoRawFd, RawFd};
 
-// Używamy libc::dup2 bezpośrednio — nix::unistd::dup2 wymaga feature "fs"
 use libc::{dup2, close};
 
 #[derive(Debug, Clone)]
@@ -48,22 +46,41 @@ pub fn parse_redirections(input: &str) -> (String, Vec<Redirect>) {
             '\'' if !in_double => { in_single = !in_single; clean.push(c); i += 1; }
             '"'  if !in_single => { in_double = !in_double; clean.push(c); i += 1; }
 
-            // heredoc <<  (but NOT process substitution <()  )
+            // heredoc <<  (but NOT process substitution <() )
             '<' if !in_single && !in_double
             && chars.get(i + 1) == Some(&'<')
             && chars.get(i + 2) != Some(&'(') =>
             {
                 i += 2;
-                while i < chars.len() && chars[i] == ' ' { i += 1; }
-                let mut delim = String::new();
-                while i < chars.len() && chars[i] != '\n' && chars[i] != ';' {
-                    delim.push(chars[i]);
+                // optional hyphen for strip-tabs
+                let mut strip_tabs = false;
+                if chars.get(i) == Some(&'-') {
+                    strip_tabs = true;
                     i += 1;
                 }
+                while i < chars.len() && chars[i] == ' ' { i += 1; }
+                let mut delim = String::new();
+                // maybe quoted delimiter
+                let quote = chars.get(i).copied();
+                if quote == Some('"') || quote == Some('\'') {
+                    i += 1;
+                    while i < chars.len() && chars[i] != quote.unwrap() {
+                        delim.push(chars[i]);
+                        i += 1;
+                    }
+                    if i < chars.len() { i += 1; } // skip closing quote
+                } else {
+                    while i < chars.len() && chars[i] != '\n' && chars[i] != ';' && !chars[i].is_whitespace() {
+                        delim.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                // store delimiter, strip-tabs flag will be handled later in heredoc body extraction
+                // For now we just store the delimiter as is; the actual body is collected in execute.rs
                 redirects.push(Redirect {
                     kind:   RedirectKind::HereDoc,
                     fd:     0,
-                    target: RedirectTarget::HereDoc(delim.trim().to_string()),
+                    target: RedirectTarget::HereDoc(delim),
                 });
             }
 
@@ -83,7 +100,7 @@ pub fn parse_redirections(input: &str) -> (String, Vec<Redirect>) {
                 clean.push_str(&subst);
             }
 
-            // N>  N>>  N>&M  N
+            // N>  N>>  N>&M  N<
             c if c.is_ascii_digit()
             && !in_single && !in_double
             && (chars.get(i + 1) == Some(&'>') || chars.get(i + 1) == Some(&'<')) =>
@@ -107,7 +124,7 @@ pub fn parse_redirections(input: &str) -> (String, Vec<Redirect>) {
                     let path = read_word(&chars, &mut i);
                     redirects.push(Redirect { kind: RedirectKind::Out, fd: src_fd, target: RedirectTarget::File(path) });
                 } else {
-                    // N
+                    // N<
                     let path = read_word(&chars, &mut i);
                     redirects.push(Redirect { kind: RedirectKind::In, fd: src_fd, target: RedirectTarget::File(path) });
                 }
@@ -143,7 +160,7 @@ pub fn parse_redirections(input: &str) -> (String, Vec<Redirect>) {
                 }
             }
 
-            //
+            // <
             '<' if !in_single && !in_double => {
                 i += 1;
                 let path = read_word(&chars, &mut i);
@@ -158,7 +175,6 @@ pub fn parse_redirections(input: &str) -> (String, Vec<Redirect>) {
 }
 
 /// Apply redirections in the child process (after fork, before exec).
-/// Uses libc::dup2 directly to avoid nix feature-gate issues.
 pub fn apply_redirections(
     redirects: &[Redirect],
     heredoc_bodies: &HashMap<String, String>,
@@ -190,7 +206,7 @@ pub fn apply_redirections(
             }
             (RedirectKind::HereDoc, RedirectTarget::HereDoc(delim)) => {
                 if let Some(body) = heredoc_bodies.get(delim) {
-                    // Create a pipe, write body into write end, dup read end to stdin
+                    // Create a pipe, write body into write end, dup read end to fd
                     let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
                     let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
                     if ret != 0 {
@@ -206,7 +222,7 @@ pub fn apply_redirections(
                         );
                         close(write_fd);
                     }
-                    safe_dup2(read_fd, 0)?;
+                    safe_dup2(read_fd, r.fd)?;
                     unsafe { close(read_fd); }
                 }
             }
