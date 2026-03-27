@@ -45,7 +45,8 @@ impl ShellHelper {
         let mut commands_cache = vec![
             "cd", "exit", "history", "which", "type", "jobs",
             "fg", "export", "source", "hsh-help", "test",
-            "hsh-settings", "hsh-docs",
+            "hsh-settings", "hsh-docs", "bg", "stop", "kill", "wait",
+            "alias", "unalias", "set", "pushd", "popd", "dirs",
         ]
         .into_iter()
         .map(String::from)
@@ -180,25 +181,41 @@ impl Completer for ShellHelper {
 
 fn subcommand_completions(cmd: &str, partial: &str) -> Option<Vec<String>> {
     let subs: &[&str] = match cmd {
-        "git"       => &["add", "commit", "push", "pull", "status", "log", "diff",
-        "branch", "checkout", "merge", "rebase", "stash", "clone",
-        "fetch", "tag", "show", "reset", "restore", "switch", "init"],
-        "cargo"     => &["build", "run", "test", "check", "clippy", "fmt", "doc",
-        "publish", "update", "add", "remove", "clean", "new", "init"],
-        "systemctl" => &["start", "stop", "restart", "enable", "disable", "status",
-        "reload", "daemon-reload", "list-units", "is-active", "mask"],
-        "apt"       => &["install", "remove", "update", "upgrade", "search",
-        "show", "list", "purge", "autoremove", "dist-upgrade"],
-        "docker"    => &["run", "build", "pull", "push", "ps", "images", "stop",
-        "start", "exec", "logs", "rm", "rmi", "compose", "inspect"],
-        "npm"       => &["install", "run", "start", "test", "build", "publish",
-        "update", "uninstall", "init", "ci", "audit"],
-        "pip"       => &["install", "uninstall", "list", "show", "freeze",
-        "search", "download", "wheel"],
-        "kubectl"   => &["get", "apply", "delete", "describe", "logs", "exec",
-        "port-forward", "scale", "rollout", "config"],
-        "make"      => &["all", "clean", "install", "test", "build", "run"],
-        _           => return None,
+        "git" => &[
+            "add", "commit -m", "push origin", "pull", "status", "log --oneline",
+            "branch -a", "checkout -b", "diff --staged", "stash push", "stash pop",
+            "reset --hard", "rebase -i", "cherry-pick", "tag", "show", "clone",
+        ],
+        "cargo" => &[
+            "build", "run", "test", "check", "clippy", "fmt", "doc",
+            "publish", "update", "add", "remove", "clean", "new", "init",
+        ],
+        "systemctl" => &[
+            "start", "stop", "restart", "enable", "disable", "status",
+            "reload", "daemon-reload", "list-units", "is-active", "mask",
+        ],
+        "apt" => &[
+            "install", "remove", "update", "upgrade", "search",
+            "show", "list", "purge", "autoremove", "dist-upgrade",
+        ],
+        "docker" => &[
+            "run", "build", "pull", "push", "ps", "images", "stop",
+            "start", "exec", "logs", "rm", "rmi", "compose", "inspect",
+        ],
+        "npm" => &[
+            "install", "run", "start", "test", "build", "publish",
+            "update", "uninstall", "init", "ci", "audit",
+        ],
+        "pip" => &[
+            "install", "uninstall", "list", "show", "freeze",
+            "search", "download", "wheel",
+        ],
+        "kubectl" => &[
+            "get", "apply", "delete", "describe", "logs", "exec",
+            "port-forward", "scale", "rollout", "config",
+        ],
+        "make" => &["all", "clean", "install", "test", "build", "run"],
+        _ => return None,
     };
     Some(
         subs.iter()
@@ -216,6 +233,24 @@ impl Hinter for ShellHelper {
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
         // Hint tylko na końcu linii (jak fish)
         if pos < line.len() { return None; }
+
+        // NEW – cd preview
+        let trimmed = line.trim();
+        if trimmed.starts_with("cd ") {
+            let arg = trimmed.strip_prefix("cd ").unwrap_or("").trim();
+            if !arg.contains('/') && !arg.contains('~') && !arg.is_empty() {
+                let current = env::current_dir().ok()?;
+                let entries: Vec<_> = std::fs::read_dir(&current).ok()?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(arg))
+                .take(5)
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+                if !entries.is_empty() {
+                    return Some(format!("\x1b[38;5;236m({})  {}\x1b[0m", entries.len(), entries.join("  ")));
+                }
+            }
+        }
 
         // 1. Historia rustyline — najwyższy priorytet
         if let Some(h) = self.hinter.hint(line, pos, ctx) {
