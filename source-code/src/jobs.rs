@@ -83,7 +83,17 @@ impl JobTable {
         }
     }
 
-    /// Poll all background jobs non-blockingly; print notification for finished ones.
+    /// Wznowienie w tle (bg)
+    pub fn bg(&self, id: usize) -> bool {
+        self.send_signal(id, Signal::SIGCONT)
+    }
+
+    /// Zatrzymanie (stop)
+    pub fn stop(&self, id: usize) -> bool {
+        self.send_signal(id, Signal::SIGSTOP)
+    }
+
+    /// Sprawdź zakończone zadania (non-blocking)
     pub fn check_finished(&mut self) {
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
@@ -111,7 +121,7 @@ impl JobTable {
                         );
                     }
                 }
-                _ => {} // Still running, or WNOHANG returned "not yet"
+                _ => {} // Still running
             }
         }
     }
