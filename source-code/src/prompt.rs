@@ -49,11 +49,24 @@ pub fn build_prompt(
 
     // ── Git segment ───────────────────────────────────────────────────────────
     let git_seg = {
-        let gs = git_info.format(" ", &t.git_color);
-        if gs.is_empty() {
-            String::new()
+        if let Some(branch) = &git_info.branch {
+            // Wybór koloru w zależności od stanu
+            let branch_color = if git_info.dirty {
+                t.error_color.clone()
+            } else if git_info.ahead > 0 || git_info.behind > 0 {
+                "\x1b[38;5;214m".to_string() // żółty
+            } else {
+                t.git_color.clone()
+            };
+            let mut gs = git_info.format(" ", &branch_color);
+            // jeśli branch jest pusty (co nie powinno się zdarzyć), pomijamy
+            if gs.is_empty() {
+                String::new()
+            } else {
+                format!("  {}{}  ", t.sep, gs)
+            }
         } else {
-            format!("  {}{}  ", t.sep, gs)
+            String::new()
         }
     };
 
@@ -103,9 +116,6 @@ pub fn build_prompt(
     let pc       = format!("{}{}{} ", pc_color, t.prompt_char, rst);
 
     // ── Assemble — wszystkie segmenty już zawierają swoje kolory ─────────────
-    //
-    //  HH:MM:SS  ~/dir  ⎇ branch  [✗ N]  took 1.2s  ❯
-    //
     let mut prompt = String::new();
     prompt.push_str(&t.time_color);
     prompt.push_str(&time);
