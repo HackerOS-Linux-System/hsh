@@ -17,26 +17,39 @@ use crate::history::ShellHistory;
 use crate::jobs::JobTable;
 use crate::path_cache::PathCache;
 use crate::redirect::{apply_redirections, parse_redirections, Redirect};
-use crate::script::{builtin_test, FunctionTable, Node, Parser};
+use crate::script::{
+    builtin_test, print_syntax_errors, validate_script, FunctionTable, Node, Parser,
+};
 use crate::security::confirm_dangerous;
 use crate::smarthints::SmartHints;
 use crate::vars::{parse_inline_env, ShellVars};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public entry point
+// Sygnały sterowania przepływem (break/continue/return)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum FlowSignal {
+    Break,
+    Continue,
+    Return(i32),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Publiczny entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn execute_command(
-    input: &str,
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
+    input:        &str,
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
     shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    dry_run: bool,
+    path_cache:   &PathCache,
+    dry_run:      bool,
 ) -> io::Result<i32> {
     let mut functions = FunctionTable::new();
     run_line(
@@ -51,37 +64,31 @@ pub async fn execute_command(
 // Heredoc extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract heredoc bodies from a multi-line string.
-/// Returns (clean_command_without_heredoc_lines, map<delimiter, body>)
 pub fn extract_heredocs(input: &str, vars: &ShellVars) -> (String, HashMap<String, String>) {
-    let mut result = String::new();
+    let mut result   = String::new();
     let mut heredocs = HashMap::new();
     let lines: Vec<&str> = input.lines().collect();
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
-        // Look for "<<", possibly with hyphen and quoted delimiter
         if let Some(pos) = line.find("<<") {
-            let after = &line[pos+2..];
+            let after = &line[pos + 2..];
             let mut chars = after.chars().peekable();
             let mut delim = String::new();
             let mut strip_tabs = false;
 
-            // Check for hyphen (strip tabs)
             if chars.peek() == Some(&'-') {
                 strip_tabs = true;
                 chars.next();
             }
-            // Skip whitespace
             while let Some(c) = chars.peek() {
                 if c.is_whitespace() { chars.next(); } else { break; }
             }
 
-            // Parse delimiter (may be quoted)
             let quote = chars.peek().copied();
             if quote == Some('"') || quote == Some('\'') {
-                chars.next(); // skip quote
+                chars.next();
                 while let Some(c) = chars.next() {
                     if c == quote.unwrap() { break; }
                     delim.push(c);
@@ -101,7 +108,6 @@ pub fn extract_heredocs(input: &str, vars: &ShellVars) -> (String, HashMap<Strin
                 continue;
             }
 
-            // Collect body until line equals delimiter
             let mut body = String::new();
             i += 1;
             while i < lines.len() {
@@ -121,7 +127,6 @@ pub fn extract_heredocs(input: &str, vars: &ShellVars) -> (String, HashMap<Strin
                 i += 1;
             }
             heredocs.insert(delim, body);
-            // Do NOT add the line with "<<" to clean command (it's removed)
         } else {
             result.push_str(line);
             result.push('\n');
@@ -136,23 +141,22 @@ pub fn extract_heredocs(input: &str, vars: &ShellVars) -> (String, HashMap<Strin
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_line(
-    input: &str,
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
+    input:        &str,
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
     shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    functions: &mut FunctionTable,
-    dry_run: bool,
+    path_cache:   &PathCache,
+    functions:    &mut FunctionTable,
+    dry_run:      bool,
 ) -> io::Result<i32> {
     let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(0);
     }
-
     if vars.xtrace {
         eprintln!("+ {}", trimmed);
     }
@@ -166,16 +170,13 @@ async fn run_line(
     }
 
     let stmts = split_compound(trimmed);
-
     if stmts.len() == 1 {
         let code = run_single(
             trimmed, aliases, rl, prev_dir, jobs, vars,
             smart_hints, shell_history, path_cache, functions, dry_run,
         )
         .await?;
-        if vars.errexit && code != 0 {
-            return Ok(code);
-        }
+        if vars.errexit && code != 0 { return Ok(code); }
         return Ok(code);
     }
 
@@ -183,17 +184,12 @@ async fn run_line(
     for (stmt, op) in stmts {
         let stmt = stmt.trim().to_string();
         if stmt.is_empty() { continue; }
-
         last_code = Box::pin(run_single(
             &stmt, aliases, rl, prev_dir, jobs, vars,
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
         .await?;
-
-        if vars.errexit && last_code != 0 {
-            return Ok(last_code);
-        }
-
+        if vars.errexit && last_code != 0 { return Ok(last_code); }
         match op.as_deref() {
             Some("&&") if last_code != 0 => break,
             Some("||") if last_code == 0 => break,
@@ -208,30 +204,46 @@ async fn run_line(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_script_node(
-    input: &str,
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
+    input:        &str,
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
     shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    functions: &mut FunctionTable,
-    dry_run: bool,
+    path_cache:   &PathCache,
+    functions:    &mut FunctionTable,
+    dry_run:      bool,
 ) -> io::Result<i32> {
     let mut parser = Parser::new(input);
     let nodes = parser.parse();
     let mut last = 0i32;
     for node in nodes {
-        last = Box::pin(exec_node(
+        match Box::pin(exec_node(
             &node, aliases, rl, prev_dir, jobs, vars,
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
-        .await?;
-        if vars.errexit && last != 0 { break; }
+        .await?
+        {
+            ExecResult::Code(c)  => { last = c; if vars.errexit && c != 0 { break; } }
+            ExecResult::Break    => break,
+            ExecResult::Continue => continue,
+            ExecResult::Return(c) => { last = c; break; }
+        }
     }
     Ok(last)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wynik wykonania węzła
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ExecResult {
+    Code(i32),
+    Break,
+    Continue,
+    Return(i32),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,67 +251,91 @@ async fn run_script_node(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn exec_node(
-    node: &Node,
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
+    node:         &Node,
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
     shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    functions: &mut FunctionTable,
-    dry_run: bool,
-) -> io::Result<i32> {
+    path_cache:   &PathCache,
+    functions:    &mut FunctionTable,
+    dry_run:      bool,
+) -> io::Result<ExecResult> {
     match node {
         Node::Command(cmd) => {
-            Box::pin(run_single(
+            let code = Box::pin(run_single(
                 cmd, aliases, rl, prev_dir, jobs, vars,
                 smart_hints, shell_history, path_cache, functions, dry_run,
             ))
-            .await
+            .await?;
+            Ok(ExecResult::Code(code))
         }
+
+        Node::Assign { name, value } => {
+            let expanded = vars.expand(value);
+            vars.set(name, &expanded);
+            env::set_var(name, &expanded);
+            Ok(ExecResult::Code(0))
+        }
+
+        Node::Break    => Ok(ExecResult::Break),
+        Node::Continue => Ok(ExecResult::Continue),
+        Node::Return(code) => Ok(ExecResult::Return(code.unwrap_or(vars.last_exit))),
 
         Node::Sequence(nodes) => {
             let mut last = 0i32;
             for n in nodes {
-                last = Box::pin(exec_node(
+                match Box::pin(exec_node(
                     n, aliases, rl, prev_dir, jobs, vars,
                     smart_hints, shell_history, path_cache, functions, dry_run,
                 ))
-                .await?;
-                if vars.errexit && last != 0 { break; }
+                .await?
+                {
+                    ExecResult::Code(c)   => { last = c; if vars.errexit && c != 0 { break; } }
+                    other                 => return Ok(other),
+                }
             }
-            Ok(last)
+            Ok(ExecResult::Code(last))
         }
 
         Node::If { condition, then_body, elif_branches, else_body } => {
-            let cond_code = Box::pin(exec_node(
+            let cond = Box::pin(exec_node(
                 condition, aliases, rl, prev_dir, jobs, vars,
                 smart_hints, shell_history, path_cache, functions, dry_run,
             ))
             .await?;
 
+            let cond_code = match cond {
+                ExecResult::Code(c) => c,
+                other               => return Ok(other),
+            };
+
             if cond_code == 0 {
-                run_nodes(then_body, aliases, rl, prev_dir, jobs, vars,
-                          smart_hints, shell_history, path_cache, functions, dry_run).await
+                run_nodes_er(then_body, aliases, rl, prev_dir, jobs, vars,
+                             smart_hints, shell_history, path_cache, functions, dry_run).await
             } else {
                 for (elif_cond, elif_body) in elif_branches {
-                    let ec = Box::pin(exec_node(
+                    let ec = match Box::pin(exec_node(
                         elif_cond, aliases, rl, prev_dir, jobs, vars,
                         smart_hints, shell_history, path_cache, functions, dry_run,
                     ))
-                    .await?;
+                    .await?
+                    {
+                        ExecResult::Code(c) => c,
+                        other               => return Ok(other),
+                    };
                     if ec == 0 {
-                        return run_nodes(elif_body, aliases, rl, prev_dir, jobs, vars,
-                                         smart_hints, shell_history, path_cache, functions, dry_run).await;
+                        return run_nodes_er(elif_body, aliases, rl, prev_dir, jobs, vars,
+                                            smart_hints, shell_history, path_cache, functions, dry_run).await;
                     }
                 }
                 if let Some(eb) = else_body {
-                    run_nodes(eb, aliases, rl, prev_dir, jobs, vars,
-                              smart_hints, shell_history, path_cache, functions, dry_run).await
+                    run_nodes_er(eb, aliases, rl, prev_dir, jobs, vars,
+                                 smart_hints, shell_history, path_cache, functions, dry_run).await
                 } else {
-                    Ok(0)
+                    Ok(ExecResult::Code(0))
                 }
             }
         }
@@ -307,17 +343,109 @@ async fn exec_node(
         Node::While { condition, body } => {
             let mut last = 0i32;
             loop {
-                let cond = Box::pin(exec_node(
+                let cond = match Box::pin(exec_node(
                     condition, aliases, rl, prev_dir, jobs, vars,
                     smart_hints, shell_history, path_cache, functions, dry_run,
                 ))
-                .await?;
+                .await?
+                {
+                    ExecResult::Code(c) => c,
+                    other               => return Ok(other),
+                };
                 if cond != 0 { break; }
-                last = run_nodes(body, aliases, rl, prev_dir, jobs, vars,
-                                 smart_hints, shell_history, path_cache, functions, dry_run).await?;
-                                 if vars.errexit && last != 0 { break; }
+                match run_nodes_er(body, aliases, rl, prev_dir, jobs, vars,
+                                   smart_hints, shell_history, path_cache, functions, dry_run).await?
+                {
+                    ExecResult::Break       => break,
+                    ExecResult::Continue    => continue,
+                    ExecResult::Return(c)   => return Ok(ExecResult::Return(c)),
+                    ExecResult::Code(c)     => {
+                        last = c;
+                        if vars.errexit && c != 0 { break; }
+                    }
+                }
             }
-            Ok(last)
+            Ok(ExecResult::Code(last))
+        }
+
+        Node::Until { condition, body } => {
+            let mut last = 0i32;
+            loop {
+                let cond = match Box::pin(exec_node(
+                    condition, aliases, rl, prev_dir, jobs, vars,
+                    smart_hints, shell_history, path_cache, functions, dry_run,
+                ))
+                .await?
+                {
+                    ExecResult::Code(c) => c,
+                    other               => return Ok(other),
+                };
+                if cond == 0 { break; } // until: wykonuj dopóki warunek FAŁSZYWY
+                match run_nodes_er(body, aliases, rl, prev_dir, jobs, vars,
+                                   smart_hints, shell_history, path_cache, functions, dry_run).await?
+                {
+                    ExecResult::Break     => break,
+                    ExecResult::Continue  => continue,
+                    ExecResult::Return(c) => return Ok(ExecResult::Return(c)),
+                    ExecResult::Code(c)   => { last = c; if vars.errexit && c != 0 { break; } }
+                }
+            }
+            Ok(ExecResult::Code(last))
+        }
+
+        Node::ForArith { init, condition, update, body } => {
+            // Wykonaj init (np. i=0)
+            if !init.trim().is_empty() {
+                let all_vars = vars.all();
+                let val_str = expand_arithmetic(init, &all_vars);
+                // Spróbuj sparsować jako assign
+                if let Some(eq) = init.find('=') {
+                    let name = init[..eq].trim();
+                    let val  = expand_arithmetic(&init[eq+1..], &all_vars);
+                    vars.set(name, &val);
+                    env::set_var(name, &val);
+                }
+            }
+
+            let mut last = 0i32;
+            loop {
+                // Sprawdź warunek
+                if !condition.trim().is_empty() {
+                    let all_vars = vars.all();
+                    let cond_val = expand_arithmetic(condition, &all_vars);
+                    if cond_val == "0" || cond_val.trim() == "0" { break; }
+                    // Jeśli cond_val == "" lub "0" → wyjdź
+                    match cond_val.parse::<i64>() {
+                        Ok(0)  => break,
+                        Ok(_)  => {}
+                        Err(_) => break,
+                    }
+                }
+
+                match run_nodes_er(body, aliases, rl, prev_dir, jobs, vars,
+                                   smart_hints, shell_history, path_cache, functions, dry_run).await?
+                {
+                    ExecResult::Break     => break,
+                    ExecResult::Continue  => {}
+                    ExecResult::Return(c) => return Ok(ExecResult::Return(c)),
+                    ExecResult::Code(c)   => { last = c; if vars.errexit && c != 0 { break; } }
+                }
+
+                // Update
+                if !update.trim().is_empty() {
+                    let all_vars = vars.all();
+                    if let Some(eq) = update.find('=') {
+                        let name = update[..eq].trim();
+                        let val  = expand_arithmetic(&update[eq+1..], &all_vars);
+                        vars.set(name, &val);
+                        env::set_var(name, &val);
+                    } else {
+                        // Wyrażenie arytmetyczne (np. i++)
+                        expand_arithmetic(update, &all_vars);
+                    }
+                }
+            }
+            Ok(ExecResult::Code(last))
         }
 
         Node::For { var, items, body } => {
@@ -326,11 +454,16 @@ async fn exec_node(
             for item in &expanded_items {
                 vars.set(var, item);
                 env::set_var(var, item);
-                last = run_nodes(body, aliases, rl, prev_dir, jobs, vars,
-                                 smart_hints, shell_history, path_cache, functions, dry_run).await?;
-                                 if vars.errexit && last != 0 { break; }
+                match run_nodes_er(body, aliases, rl, prev_dir, jobs, vars,
+                                   smart_hints, shell_history, path_cache, functions, dry_run).await?
+                {
+                    ExecResult::Break     => break,
+                    ExecResult::Continue  => continue,
+                    ExecResult::Return(c) => return Ok(ExecResult::Return(c)),
+                    ExecResult::Code(c)   => { last = c; if vars.errexit && c != 0 { break; } }
+                }
             }
-            Ok(last)
+            Ok(ExecResult::Code(last))
         }
 
         Node::Case { word, arms } => {
@@ -338,44 +471,74 @@ async fn exec_node(
             for (patterns, body) in arms {
                 for pat in patterns {
                     if glob_match(pat, &word) {
-                        return run_nodes(body, aliases, rl, prev_dir, jobs, vars,
-                                         smart_hints, shell_history, path_cache, functions, dry_run).await;
+                        return run_nodes_er(body, aliases, rl, prev_dir, jobs, vars,
+                                            smart_hints, shell_history, path_cache, functions, dry_run).await;
                     }
                 }
             }
-            Ok(0)
+            Ok(ExecResult::Code(0))
         }
 
         Node::FunctionDef { name, body } => {
             functions.define(name, body.clone());
-            Ok(0)
+            Ok(ExecResult::Code(0))
         }
     }
 }
 
-async fn run_nodes(
-    nodes: &[Node],
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
+async fn run_nodes_er(
+    nodes:        &[Node],
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
     shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    functions: &mut FunctionTable,
-    dry_run: bool,
-) -> io::Result<i32> {
+    path_cache:   &PathCache,
+    functions:    &mut FunctionTable,
+    dry_run:      bool,
+) -> io::Result<ExecResult> {
     let mut last = 0i32;
     for node in nodes {
-        last = Box::pin(exec_node(
+        match Box::pin(exec_node(
             node, aliases, rl, prev_dir, jobs, vars,
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
-        .await?;
-        if vars.errexit && last != 0 { break; }
+        .await?
+        {
+            ExecResult::Code(c) => {
+                last = c;
+                if vars.errexit && c != 0 { return Ok(ExecResult::Code(c)); }
+            }
+            other => return Ok(other),
+        }
     }
-    Ok(last)
+    Ok(ExecResult::Code(last))
+}
+
+// Zachowana kompatybilność — wrapper dla starych wywołań
+async fn run_nodes(
+    nodes:        &[Node],
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
+    shell_history: &mut ShellHistory,
+    path_cache:   &PathCache,
+    functions:    &mut FunctionTable,
+    dry_run:      bool,
+) -> io::Result<i32> {
+    match run_nodes_er(nodes, aliases, rl, prev_dir, jobs, vars,
+                       smart_hints, shell_history, path_cache, functions, dry_run).await?
+    {
+        ExecResult::Code(c)  => Ok(c),
+        ExecResult::Break    => Ok(0),
+        ExecResult::Continue => Ok(0),
+        ExecResult::Return(c) => Ok(c),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -383,17 +546,17 @@ async fn run_nodes(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_single(
-    input: &str,
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
+    input:        &str,
+    aliases:      &HashMap<String, String>,
+    rl:           &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:     &mut Option<PathBuf>,
+    jobs:         &mut JobTable,
+    vars:         &mut ShellVars,
+    smart_hints:  &mut SmartHints,
     shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    functions: &mut FunctionTable,
-    dry_run: bool,
+    path_cache:   &PathCache,
+    functions:    &mut FunctionTable,
+    dry_run:      bool,
 ) -> io::Result<i32> {
 
     // 1. Variable expansion + arithmetic $((…))
@@ -436,12 +599,22 @@ async fn run_single(
         if let Some(fname) = parts.first() {
             if functions.contains(fname) {
                 let body = functions.get(fname).cloned().unwrap_or_default();
+                // Ustaw argumenty pozycyjne
+                vars.positional = parts[1..].to_vec();
                 for (i, arg) in parts[1..].iter().enumerate() {
                     vars.set(&(i + 1).to_string(), arg);
                     env::set_var((i + 1).to_string(), arg);
                 }
-                return run_nodes(&body, aliases, rl, prev_dir, jobs, vars,
-                                 smart_hints, shell_history, path_cache, functions, dry_run).await;
+                let result = run_nodes_er(&body, aliases, rl, prev_dir, jobs, vars,
+                                         smart_hints, shell_history, path_cache, functions, dry_run).await?;
+                let code = match result {
+                    ExecResult::Code(c)  => c,
+                    ExecResult::Return(c) => c,
+                    ExecResult::Break     => 0,
+                    ExecResult::Continue  => 0,
+                };
+                vars.last_exit = code;
+                return Ok(code);
             }
         }
     }
@@ -469,8 +642,8 @@ async fn run_single(
     let (background, rest) = strip_background_flag(&rest);
     let rest = rest.trim().to_string();
 
-    // 12. .sh chmod  /  .hl rewrite
-    maybe_chmod(&rest);
+    // 12. .sh chmod + walidacja składni
+    maybe_chmod_and_validate(&rest);
     let rest = maybe_hl_run(rest);
 
     // 13. Dry-run
@@ -492,18 +665,17 @@ async fn run_single(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Simple command — native redirections via pre_exec + dup2
+// Simple command
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_simple(
-    cmd: &str,
-    inline_env: &[(String, String)],
-                    jobs: &mut JobTable,
-                    background: bool,
-                    vars: &mut ShellVars,
-                    heredoc_bodies: &HashMap<String, String>,
+    cmd:            &str,
+    inline_env:     &[(String, String)],
+    jobs:           &mut JobTable,
+    background:     bool,
+    vars:           &mut ShellVars,
+    heredoc_bodies: &HashMap<String, String>,
 ) -> io::Result<i32> {
-
     let (clean_cmd, redirects) = parse_redirections(cmd);
 
     let raw: Vec<String> = shlex::split(&clean_cmd).unwrap_or_default();
@@ -512,7 +684,6 @@ async fn run_simple(
     let program = parts[0].clone();
     let argv: Vec<String> = parts[1..].to_vec();
 
-    // Native builtins (no process spawn needed)
     if let Some(code) = dispatch_native(&program, &argv) {
         vars.last_exit = code;
         return Ok(code);
@@ -529,9 +700,7 @@ async fn run_simple(
         let r = redirects_for_child.clone();
         let h = heredocs_for_child.clone();
         unsafe {
-            builder.pre_exec(move || {
-                apply_redirections(&r, &h)
-            });
+            builder.pre_exec(move || apply_redirections(&r, &h));
         }
     }
 
@@ -566,12 +735,12 @@ async fn run_simple(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_pipeline(
-    stages: &[String],
-    inline_env: &[(String, String)],
-                      jobs: &mut JobTable,
-                      background: bool,
-                      vars: &mut ShellVars,
-                      heredoc_bodies: &HashMap<String, String>,
+    stages:         &[String],
+    inline_env:     &[(String, String)],
+    jobs:           &mut JobTable,
+    background:     bool,
+    vars:           &mut ShellVars,
+    heredoc_bodies: &HashMap<String, String>,
 ) -> io::Result<i32> {
     if stages.is_empty() { return Ok(0); }
     if stages.len() == 1 {
@@ -588,8 +757,8 @@ async fn run_pipeline(
         let (clean_stage, redirects) = parse_redirections(stage);
 
         let stdin_cfg: Stdio = prev_stdout.take()
-        .map(Stdio::from)
-        .unwrap_or_else(Stdio::inherit);
+            .map(Stdio::from)
+            .unwrap_or_else(Stdio::inherit);
         let stdout_cfg: Stdio = if is_last { Stdio::inherit() } else { Stdio::piped() };
 
         let raw: Vec<String> = shlex::split(&clean_stage).unwrap_or_default();
@@ -597,7 +766,7 @@ async fn run_pipeline(
         if parts.is_empty() { continue; }
 
         let redirects_for_child: Vec<Redirect> = redirects;
-        let heredocs_for_child = heredoc_bodies.clone();
+        let heredocs_for_child  = heredoc_bodies.clone();
 
         let mut cmd = std::process::Command::new(&parts[0]);
         cmd.args(&parts[1..]).stdin(stdin_cfg).stdout(stdout_cfg);
@@ -606,11 +775,7 @@ async fn run_pipeline(
         if !redirects_for_child.is_empty() {
             let r = redirects_for_child.clone();
             let h = heredocs_for_child.clone();
-            unsafe {
-                cmd.pre_exec(move || {
-                    apply_redirections(&r, &h)
-                });
-            }
+            unsafe { cmd.pre_exec(move || apply_redirections(&r, &h)); }
         }
 
         let mut child = match cmd.spawn() {
@@ -650,37 +815,83 @@ async fn run_pipeline(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Source
+// Source — obsługa plików .sh z walidacją składni
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_source(
-    file_path: &str,
-    aliases: &HashMap<String, String>,
-    rl: &mut Editor<ShellHelper, rustyline::history::FileHistory>,
-    prev_dir: &mut Option<PathBuf>,
-    jobs: &mut JobTable,
-    vars: &mut ShellVars,
-    smart_hints: &mut SmartHints,
-    shell_history: &mut ShellHistory,
-    path_cache: &PathCache,
-    functions: &mut FunctionTable,
-    dry_run: bool,
+    file_path:     &str,
+    aliases:       &HashMap<String, String>,
+    rl:            &mut Editor<ShellHelper, rustyline::history::FileHistory>,
+    prev_dir:      &mut Option<PathBuf>,
+    jobs:          &mut JobTable,
+    vars:          &mut ShellVars,
+    smart_hints:   &mut SmartHints,
+    shell_history:  &mut ShellHistory,
+    path_cache:    &PathCache,
+    functions:     &mut FunctionTable,
+    dry_run:       bool,
 ) -> io::Result<i32> {
     let contents = read_to_string(file_path).map_err(|e| {
         eprintln!("hsh: source: {}: {}", file_path, e);
         e
     })?;
-    let mut last_code = 0i32;
-    for line in contents.lines() {
-        let tl = line.trim();
+
+    // Walidacja składni dla plików .sh
+    let is_sh = file_path.ends_with(".sh") || file_path.ends_with(".hsh");
+    if is_sh {
+        let checks = validate_script(&contents);
+        let has_errors = print_syntax_errors(file_path, &checks);
+        if has_errors && vars.errexit {
+            eprintln!("hsh: source: {} zawiera błędy składni, przerywam", file_path);
+            return Ok(1);
+        }
+    }
+
+    // Wykonaj linię po linii, łącząc wieloliniowe konstrukty
+    let mut multiline_buf = String::new();
+    let mut last_code     = 0i32;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim_end();
+
+        // Kontynuacja linii z \
+        if line.ends_with('\\') {
+            multiline_buf.push_str(&line[..line.len() - 1]);
+            multiline_buf.push(' ');
+            continue;
+        }
+
+        multiline_buf.push_str(line);
+        let to_exec = std::mem::take(&mut multiline_buf);
+
+        let tl = to_exec.trim();
         if tl.is_empty() || tl.starts_with('#') { continue; }
+
+        if vars.xtrace {
+            eprintln!("+ {}", tl);
+        }
+
         last_code = Box::pin(run_line(
-            line, aliases, rl, prev_dir, jobs, vars,
+            &to_exec, aliases, rl, prev_dir, jobs, vars,
             smart_hints, shell_history, path_cache, functions, dry_run,
         ))
         .await?;
+
         if vars.errexit && last_code != 0 { break; }
     }
+
+    // Jeśli zostały dane w buforze (np. brak końcowego newline)
+    if !multiline_buf.trim().is_empty() {
+        let tl = multiline_buf.trim();
+        if !tl.starts_with('#') {
+            last_code = Box::pin(run_line(
+                &multiline_buf, aliases, rl, prev_dir, jobs, vars,
+                smart_hints, shell_history, path_cache, functions, dry_run,
+            ))
+            .await?;
+        }
+    }
+
     Ok(last_code)
 }
 
@@ -704,9 +915,9 @@ fn expand_globs(args: Vec<String>) -> Vec<String> {
             match glob::glob(&arg) {
                 Ok(paths) => {
                     let exp: Vec<String> = paths
-                    .filter_map(|p| p.ok())
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect();
+                        .filter_map(|p| p.ok())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
                     if exp.is_empty() { result.push(arg); } else { result.extend(exp); }
                 }
                 Err(_) => result.push(arg),
@@ -725,11 +936,16 @@ fn expand_for_items(items: &[String], vars: &ShellVars) -> Vec<String> {
         if expanded.contains('*') || expanded.contains('?') {
             if let Ok(paths) = glob::glob(&expanded) {
                 let v: Vec<String> = paths
-                .filter_map(|p| p.ok())
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
+                    .filter_map(|p| p.ok())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
                 if !v.is_empty() { result.extend(v); continue; }
             }
+        }
+        // Obsługa $@ i "$@"
+        if expanded == "$@" || expanded == "\"$@\"" {
+            result.extend(vars.positional.clone());
+            continue;
         }
         result.push(expanded);
     }
@@ -802,16 +1018,16 @@ fn split_compound(input: &str) -> Vec<(String, Option<String>)> {
 
 fn is_script_construct(input: &str) -> bool {
     let first = input.split_whitespace().next().unwrap_or("");
-    matches!(first, "if" | "for" | "while" | "case")
-    || input.contains("() {")
-    || input.contains("(){")
-    || (input.contains("()") && input.contains('{'))
+    matches!(first, "if" | "for" | "while" | "until" | "case" | "function")
+        || input.contains("() {")
+        || input.contains("(){")
+        || (input.contains("()") && input.contains('{'))
 }
 
 fn strip_source_prefix(input: &str) -> Option<String> {
     input.strip_prefix("source ")
-    .or_else(|| input.strip_prefix(". "))
-    .map(|s| s.trim().to_string())
+        .or_else(|| input.strip_prefix(". "))
+        .map(|s| s.trim().to_string())
 }
 
 fn strip_background_flag(input: &str) -> (bool, String) {
@@ -844,9 +1060,9 @@ fn check_auto_sudo(input: &str) -> String {
     let file = &parts[1];
     if !file.starts_with("/etc/") && !file.starts_with("/usr/")
         && !file.starts_with("/var/") && !file.starts_with("/boot/") {
-            return input.to_string();
-        }
-        eprint!("\x1b[1;33m⚠  '{}' requires root. Use sudo? [y/n] \x1b[0m", file);
+        return input.to_string();
+    }
+    eprint!("\x1b[1;33m⚠  '{}' requires root. Use sudo? [y/n] \x1b[0m", file);
     io::stdout().flush().ok();
     let mut ans = String::new();
     io::stdin().read_line(&mut ans).ok();
@@ -857,15 +1073,23 @@ fn check_auto_sudo(input: &str) -> String {
     }
 }
 
-fn maybe_chmod(cmd: &str) {
+/// Nadaj prawa wykonania do .sh i zwaliduj składnię
+fn maybe_chmod_and_validate(cmd: &str) {
     let first = cmd.split_whitespace().next().unwrap_or("");
-    if first.ends_with(".sh") {
+    if first.ends_with(".sh") || first.ends_with(".hsh") {
         let p = Path::new(first);
         if let Ok(meta) = p.metadata() {
             let mut perms = meta.permissions();
             if perms.mode() & 0o111 == 0 {
                 perms.set_mode(perms.mode() | 0o111);
                 let _ = std::fs::set_permissions(p, perms);
+            }
+        }
+        // Walidacja składni
+        if let Ok(content) = read_to_string(first) {
+            let checks = validate_script(&content);
+            if !checks.is_empty() {
+                print_syntax_errors(first, &checks);
             }
         }
     }
@@ -883,7 +1107,7 @@ fn glob_match(pattern: &str, word: &str) -> bool {
     }
     match_glob(
         &pattern.chars().collect::<Vec<_>>(), 0,
-               &word.chars().collect::<Vec<_>>(), 0,
+        &word.chars().collect::<Vec<_>>(), 0,
     )
 }
 
