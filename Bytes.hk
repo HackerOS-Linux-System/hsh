@@ -1,1 +1,14 @@
+[package]
+-> name    => hsh
+-> version => 0.6.0
+-> description => hsh — a shell for HackerOS.
+-> license => HackerOS Team <hackeros068@gmail.com>
 
+[build]
+-> lang   => h#
+-> entry  => src/main.h#
+-> output => build/hsh
+-> emit   => bin
+
+[deps]
+-> hprompt => newest
