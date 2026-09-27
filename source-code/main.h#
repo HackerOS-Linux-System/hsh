@@ -1,0 +1,263 @@
+use "bytes -> hprompt" from "hp"
+use "std -> fs"              from "fs"
+use "std -> io"               from "io"
+use "std -> process"           from "proc"
+mod util
+mod vars
+mod theme
+mod git_info
+mod prompt
+mod config
+mod security
+mod history
+mod path_cache
+mod execute
+mod helper
+mod docs
+mod settings
+fn hshrc_path() -> string is
+    let home = util::getenv_safe("HOME")
+    if home == "" is return ".hshrc" end
+    return home + "/.hshrc"
+end
+
+fn hprompt_history_path() -> string is
+    let home = util::getenv_safe("HOME")
+    if home == "" is return ".hsh_history" end
+    return home + "/.hsh_history"
+end
+
+fn rich_history_path() -> string is
+    let home = util::getenv_safe("HOME")
+    if home == "" is return ".hsh_history.rich" end
+    return home + "/.hsh_history.rich"
+end
+
+fn path_cache_file() -> string is
+    let home = util::getenv_safe("HOME")
+    if home == "" is return "/tmp/.hsh_path_cache" end
+    return home + "/.hsh_path_cache"
+end
+
+;; Tracks block-keyword nesting depth across a growing set of lines,
+;; to decide whether the REPL needs to keep reading continuation lines
+;; before the input is a complete statement (an `if`/`while`/`until`/
+;; `for`/`function` opened but not yet closed). Deliberately simple —
+;; keyword counting, not a full parse — a stand-in for the original's
+;; `check_completeness` (see helper.h#'s module doc comment for why
+;; that couldn't be ported as live validation).
+fn block_depth_delta(line: string) -> int is
+    let kw = util::first_word(line.trim())
+    let mut delta = 0
+    if kw == "if" is delta = delta + 1 end
+    if kw == "while" is delta = delta + 1 end
+    if kw == "until" is delta = delta + 1 end
+    if kw == "for" is delta = delta + 1 end
+    if kw == "function" is delta = delta + 1 end
+    if kw == "fi" is delta = delta - 1 end
+    if kw == "done" is delta = delta - 1 end
+    let t = line.trim()
+    if t == "}" is delta = delta - 1 end
+    if t.ends_with("{") is
+        if !t.starts_with("if") && !t.starts_with("while") && !t.starts_with("until") && !t.starts_with("for") is
+            delta = delta + 1
+        end
+    end
+    return delta
+end
+
+fn is_git_dir_hint() -> bool is
+    return fs::exists(".git")
+end
+
+fn build_git_info_for_prompt() -> git_info::GitInfo is
+    if !is_git_dir_hint() is return git_info::GitInfo { branch: "", dirty: false, ahead: 0, behind: 0 } end
+    return git_info::git_fetch_info()
+end
+
+fn now_ts() -> int is
+    return __builtin_time_now_unix()
+end
+
+fn now_ms() -> int is
+    return __builtin_time_now_unix() * 1000
+end
+
+;; ── settings command ─────────────────────────────────────────────────────
+
+fn run_settings(mut sh: execute::Shell, mut ed: any) -> (execute::Shell, any) is
+    settings::settings_render_theme_menu()
+    let (ed1, result) = hp::editor_readline_with(ed, "> ")
+    ed = ed1
+    if hp::result_is_line(result) is
+        let choice = settings::settings_parse_theme_choice(result.line)
+        if choice != "" is
+            sh.theme_name = choice
+            write("Motyw ustawiony na: " + choice)
+        end
+    end
+    return (sh, ed)
+end
+
+;; ── main REPL ────────────────────────────────────────────────────────────
+
+fn main() is
+    let mut sh = execute::shell_new(0)
+    sh = fix_shell_pid(sh)
+
+    let rc = hshrc_path()
+    config::ensure_hshrc_exists(rc)
+    let result = config::load_hshrc(sh.v, sh.aliases, rc)
+    sh.v = result.v
+    sh.aliases = result.aliases
+    sh.theme_name = result.cfg.default_theme
+    sh.v.opt_errexit = result.cfg.errexit
+    sh.v.opt_xtrace = result.cfg.xtrace
+    sh.v.opt_nounset = result.cfg.nounset
+    sh.confirm_dangerous = result.cfg.confirm_dangerous
+    sh.denied_commands = result.cfg.deny_commands
+
+    let home = util::getenv_safe("HOME")
+    let mut rich_hist = history::rich_history_load(rich_history_path(), home)
+
+    let mut pcache = path_cache::path_cache_new(path_cache_file(), util::getenv_safe("PATH"))
+
+    let mut ed = hp::editor_new()
+    let words = helper::build_completion_words(sh.aliases, pcache)
+    ed = hp::editor_set_completer(ed, hp::completer_from_words(words))
+    ed = hp::editor_set_tab_complete(ed, true)
+    let (ed1, _loaded) = hp::editor_load_history(ed, hprompt_history_path())
+    ed = ed1
+
+    write("hsh (port H#) — wpisz 'help' po listę poleceń, 'exit' aby wyjść.")
+
+    let mut keep_going = true
+    while keep_going is
+        pcache = path_cache::path_cache_refresh_if_stale(pcache, util::getenv_safe("PATH"))
+        let git = build_git_info_for_prompt()
+        let cwd = fs::cwd()
+        let theme = theme::theme_by_name(sh.theme_name)
+        let prompt_text = prompt::build_prompt(cwd, home, sh.v.last_exit, sh.last_duration_ms,
+                                            sh.shell_depth, git, theme)
+
+        let (ed2, first_result) = hp::editor_readline_with(ed, prompt_text)
+        ed = ed2
+
+        let mut should_process = true
+        if hp::result_is_eof(first_result) is
+            write("")
+            should_process = false
+            keep_going = false
+        end
+
+        if should_process is
+            let (accum, ed3) = read_full_statement(ed, first_result.line)
+            ed = ed3
+
+            let cmd_for_history = accum.trim()
+            if cmd_for_history == "settings" is
+                let (sh_a, ed_a) = run_settings(sh, ed)
+                sh = sh_a
+                ed = ed_a
+            end
+            if cmd_for_history != "settings" is
+                if cmd_for_history == "history" is
+                    history::rich_history_print_all(rich_hist)
+                end
+                if cmd_for_history != "history" is
+                    if util::first_word(cmd_for_history) == "help" is
+                        let topic = util::rest_after_first_word(cmd_for_history).trim()
+                        if topic == "" is
+                            execute::builtin_help_public()
+                        end
+                        if topic != "" is
+                            docs::docs_show(topic)
+                        end
+                    end
+                    if util::first_word(cmd_for_history) != "help" is
+                        let start_ms = now_ms()
+                        sh = run_statement_text(sh, sh.aliases, accum)
+                        let elapsed = now_ms() - start_ms
+                        sh.last_duration_ms = elapsed
+                    end
+                end
+            end
+
+            if cmd_for_history != "" is
+                rich_hist = history::rich_history_add(rich_hist, cmd_for_history, now_ts())
+            end
+            if !sh.running is keep_going = false end
+        end
+    end
+
+    hp::editor_save_history(ed, hprompt_history_path())
+    rich_hist = history::rich_history_save(rich_hist)
+end
+
+;; The shell's own PID (for `$$`), fetched via `sh -c 'echo $$'` since
+;; H# has no direct `getpid()` binding exposed to user code.
+fn fix_shell_pid(mut sh: execute::Shell) -> execute::Shell is
+    let pid_str = get_shell_pid_str()
+    let mut pid = 0
+    if util::is_all_digits(pid_str) is pid = pid_str.parse_int() end
+    ;; Explicit type annotation here instead of `sh.v.shell_pid = pid`
+    ;; directly: `sh.v` is declared `any` (see vars::ShellVars comment
+    ;; in execute.h#'s `Shell` struct), so a *nested* assignment through
+    ;; it — `sh.v.shell_pid = pid` — can't statically resolve which
+    ;; struct `.shell_pid` belongs to. The read side warns and falls
+    ;; back to scanning every struct for a same-named field; the
+    ;; assign side (verified in the compiler's `assign_lvalue`) does
+    ;; the same scan but WITHOUT any warning, silently defaulting to
+    ;; index 0 if nothing matches. Binding through a locally-annotated
+    ;; `vars::ShellVars` sidesteps that fallback entirely: the field
+    ;; index for both `.shell_pid` (on `v`) and `.v` (on `sh`) is then
+    ;; resolved unambiguously from a statically known struct, with no
+    ;; guessing involved anywhere in the chain.
+    let mut v: vars::ShellVars = sh.v
+    v.shell_pid = pid
+    sh.v = v
+    return sh
+end
+
+fn get_shell_pid_str() -> string is
+    return proc::run("echo $$").trim()
+end
+
+;; Reads additional lines (with a continuation prompt) until the
+;; accumulated text has balanced `if/fi`, `while/done`, `until/done`,
+;; `for/done`, `function { }` nesting — see `block_depth_delta`'s
+;; comment for what this checks and why it's a simple heuristic
+;; instead of a full parse.
+fn read_full_statement(mut ed: any, first_line: string) -> (string, any) is
+    let mut accum = first_line
+    let mut depth = block_depth_delta(first_line)
+    while depth > 0 is
+        let (ed2, r) = hp::editor_readline_with(ed, "> ")
+        ed = ed2
+        if hp::result_is_eof(r) is
+            depth = 0
+        end
+        if hp::result_is_line(r) is
+            accum = accum + "\n" + r.line
+            depth = depth + block_depth_delta(r.line)
+        end
+    end
+    return (accum, ed)
+end
+
+;; Runs a (possibly multi-line) accumulated statement: single line ->
+;; ordinary dispatch; multi-line -> parsed as a script block (so
+;; if/while/for typed interactively work the same as sourced).
+fn run_statement_text(mut sh: execute::Shell, aliases: any, text: string) -> execute::Shell is
+    if !text.contains("\n") is
+        let expanded = expand_for_run(sh, text)
+        return execute::dispatch_line(sh, hashmap_new(), expanded)
+    end
+    let lines = text.split("\n")
+    let (stmts, _stop) = execute::parse_block(lines, 0, [])
+    return execute::exec_stmt_list(sh, hashmap_new(), stmts)
+end
+
+fn expand_for_run(sh: execute::Shell, text: string) -> string is
+    return vars::expand_line(sh.v, vars::expand_alias(sh.aliases, text))
+end
