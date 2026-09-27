@@ -1,0 +1,1034 @@
+use "std -> fs"             from "fs"
+use "std -> io"             from "io"
+use "std -> process"        from "proc"
+mod util
+mod vars
+mod security
+mod history
+mod jobs
+mod theme
+mod config
+mod path_cache
+;; ── AST ──────────────────────────────────────────────────────────────────
+;; A tagged struct, not an enum — see README.md's porting notes for
+;; why (matching on an imported enum is a known-unreliable path in
+;; this interpreter). `kind` is one of: "cmd", "if", "while", "until",
+;; "for", "func_def", "break", "continue", "return", "assign".
+
+struct Stmt is
+    pub kind: string
+    pub text: string          ;; "cmd": the command text. "if"/"while"/"until": the condition text. "return": the code text (may be ""). "assign": "NAME=value".
+    pub body: [Stmt]           ;; primary body: then-branch / while-body / until-body / for-body / function-body
+    pub elif_conds: [string]    ;; "if" only: one condition text per elif, same order as elif_bodies
+    pub elif_bodies: [[Stmt]]    ;; "if" only: one body per elif, same order as elif_conds
+    pub else_body: [Stmt]         ;; "if" only
+    pub for_var: string             ;; "for" only
+    pub for_words: string            ;; "for" only: the raw " in WORDS" text (expanded at run time)
+    pub func_name: string             ;; "func_def" only
+end
+
+fn stmt_cmd(text: string) -> Stmt is
+    return Stmt { kind: "cmd", text: text, body: [], elif_conds: [], elif_bodies: [],
+                  else_body: [], for_var: "", for_words: "", func_name: "" }
+end
+
+;; ── line classification ──────────────────────────────────────────────────
+
+fn strip_trailing_marker(line: string, marker: string) -> (string, bool) is
+    let mut t = line.trim()
+    let mut found = false
+
+    if t == marker is return ("", true) end
+
+    if t.ends_with(marker) is
+        let before_marker = t[0..t.len() - marker.len()]
+        let mut ends_cleanly = false
+        if before_marker.ends_with(" ") is ends_cleanly = true end
+        if before_marker.ends_with(";") is ends_cleanly = true end
+        if before_marker.ends_with("\t") is ends_cleanly = true end
+        if ends_cleanly is
+            t = before_marker.trim()
+            found = true
+        end
+    end
+
+    if found is
+        if t.ends_with(";") is t = t[0..t.len() - 1].trim() end
+    end
+
+    return (t, found)
+end
+
+fn line_keyword(line: string) -> string is
+    let t = line.trim()
+    return util::first_word(t)
+end
+
+;; ── block parser ─────────────────────────────────────────────────────────
+;; `parse_block(lines, start, stop_words)` parses statements starting
+;; at `lines[start]` until it hits a line whose keyword is in
+;; `stop_words` (that line is NOT consumed — the caller inspects it).
+;; Returns (statements, index_of_the_stopping_line_or_lines.len()).
+
+pub fn parse_block(lines: [string], start: int, stop_words: [string]) -> ([Stmt], int) is
+    let mut stmts: [Stmt] = []
+    let mut i = start
+    let mut stop_idx = lines.len()
+    let mut stopped = false
+    while i < lines.len() && !stopped is
+        let cur = i
+        let raw = lines[cur]
+        let trimmed = raw.trim()
+
+        if trimmed == "" is
+            i = i + 1
+        end
+        if trimmed != "" is
+            if trimmed.starts_with("#") is
+                i = i + 1
+            end
+            if !trimmed.starts_with("#") is
+                let kw = line_keyword(trimmed)
+                if is_in(stop_words, kw) is
+                    stop_idx = cur
+                    stopped = true
+                end
+                if !stopped is
+                    let (stmt, next_i) = parse_one(lines, cur)
+                    stmts.push(stmt)
+                    i = next_i
+                end
+            end
+        end
+    end
+    if !stopped is stop_idx = lines.len() end
+    return (stmts, stop_idx)
+end
+
+fn is_in(words: [string], w: string) -> bool is
+    let mut i = 0
+    let mut found = false
+    while i < words.len() is
+        let cur = i
+        i = i + 1
+        if words[cur] == w is found = true end
+    end
+    return found
+end
+
+;; Parses exactly one statement starting at `lines[at]` (which is not
+;; blank/comment). Returns (statement, index_of_next_unconsumed_line).
+fn parse_one(lines: [string], at: int) -> (Stmt, int) is
+    let trimmed = lines[at].trim()
+    let kw = line_keyword(trimmed)
+
+    if kw == "if" is return parse_if(lines, at) end
+    if kw == "while" is return parse_while(lines, at) end
+    if kw == "until" is return parse_until(lines, at) end
+    if kw == "for" is return parse_for(lines, at) end
+    if kw == "function" is return parse_func_def(lines, at) end
+    if kw == "break" is return (Stmt { kind: "break", text: "", body: [], elif_conds: [], elif_bodies: [], else_body: [], for_var: "", for_words: "", func_name: "" }, at + 1) end
+    if kw == "continue" is return (Stmt { kind: "continue", text: "", body: [], elif_conds: [], elif_bodies: [], else_body: [], for_var: "", for_words: "", func_name: "" }, at + 1) end
+    if kw == "return" is
+        let arg = util::rest_after_first_word(trimmed)
+        return (Stmt { kind: "return", text: arg, body: [], elif_conds: [], elif_bodies: [], else_body: [], for_var: "", for_words: "", func_name: "" }, at + 1)
+    end
+
+    ;; `NAME() { ... }` function definition (alternate syntax)
+    if is_func_paren_def(trimmed) is return parse_func_paren_def(lines, at) end
+
+    ;; plain assignment: `NAME=value` (no spaces before '=', matches
+    ;; the original's simple heuristic)
+    if is_plain_assignment(trimmed) is
+        return (Stmt { kind: "assign", text: trimmed, body: [], elif_conds: [], elif_bodies: [], else_body: [], for_var: "", for_words: "", func_name: "" }, at + 1)
+    end
+
+    return (stmt_cmd(trimmed), at + 1)
+end
+
+fn is_func_paren_def(line: string) -> bool is
+    let paren = line.index_of("()")
+    if paren < 0 is return false end
+    let name = line[0..paren].trim()
+    if name == "" is return false end
+    return util::is_alpha(name[0..1])
+end
+
+fn is_plain_assignment(line: string) -> bool is
+    let eq = line.index_of("=")
+    if eq <= 0 is return false end
+    let name = line[0..eq]
+    if name.contains(" ") is return false end
+    if !util::is_alpha(name[0..1]) is return false end
+    let mut i = 0
+    let mut ok = true
+    while i < name.len() is
+        let cur = i
+        i = i + 1
+        if !util::is_alnum(name[cur..cur + 1]) is ok = false end
+    end
+    return ok
+end
+
+;; Extracts the condition text from a line starting with `kw` (e.g.
+;; "if", "while", "until"), and whether a trailing "; then"/"; do"/
+;; bare "then"/"do" was found on the SAME line.
+fn extract_header(line: string, kw: string, marker: string) -> (string, bool) is
+    let after_kw = line.trim()[kw.len()..line.trim().len()].trim()
+    return strip_trailing_marker(after_kw, marker)
+end
+
+;; If `has_marker` is false, `next_i` points at a line that should be
+;; a bare marker ("then"/"do") on its own — skip it if so. Returns the
+;; index of the first body line either way.
+fn skip_bare_marker(lines: [string], next_i: int, marker: string) -> int is
+    let mut i = next_i
+    let mut going = true
+    while i < lines.len() && going is
+        let cur = i
+        let t = lines[cur].trim()
+        if t == "" is
+            i = i + 1
+        end
+        if t != "" is
+            going = false
+            if t == marker is i = i + 1 end
+        end
+    end
+    return i
+end
+
+fn parse_if(lines: [string], at: int) -> (Stmt, int) is
+    let (cond0, has_then0) = extract_header(lines[at], "if", "then")
+    let mut body_start = at + 1
+    if !has_then0 is body_start = skip_bare_marker(lines, at + 1, "then") end
+
+    let (then_body, stop1) = parse_block(lines, body_start, ["elif", "else", "fi"])
+
+    let mut elif_conds: [string] = []
+    let mut elif_bodies: [[Stmt]] = []
+    let mut else_body: [Stmt] = []
+    let mut cursor = stop1
+    let mut going = cursor < lines.len()
+    while going is
+        let kw = line_keyword(lines[cursor].trim())
+        if kw == "elif" is
+            let (econd, ehas) = extract_header(lines[cursor], "elif", "then")
+            let mut ebody_start = cursor + 1
+            if !ehas is ebody_start = skip_bare_marker(lines, cursor + 1, "then") end
+            let (ebody, estop) = parse_block(lines, ebody_start, ["elif", "else", "fi"])
+            elif_conds.push(econd)
+            elif_bodies.push(ebody)
+            cursor = estop
+            going = cursor < lines.len()
+        end
+        if kw == "else" is
+            let (eb, estop) = parse_block(lines, cursor + 1, ["fi"])
+            else_body = eb
+            cursor = estop
+            going = false
+        end
+        if kw == "fi" is going = false end
+        if kw != "elif" && kw != "else" && kw != "fi" is going = false end
+    end
+
+    let mut next_i = cursor
+    if next_i < lines.len() is
+        if line_keyword(lines[next_i].trim()) == "fi" is next_i = next_i + 1 end
+    end
+
+    let stmt = Stmt { kind: "if", text: cond0, body: then_body,
+                       elif_conds: elif_conds, elif_bodies: elif_bodies,
+                       else_body: else_body, for_var: "", for_words: "", func_name: "" }
+    return (stmt, next_i)
+end
+
+fn parse_while(lines: [string], at: int) -> (Stmt, int) is
+    let (cond, has_do) = extract_header(lines[at], "while", "do")
+    let mut body_start = at + 1
+    if !has_do is body_start = skip_bare_marker(lines, at + 1, "do") end
+    let (body, stop_at) = parse_block(lines, body_start, ["done"])
+    let mut next_i = stop_at
+    if next_i < lines.len() is next_i = next_i + 1 end
+    let stmt = Stmt { kind: "while", text: cond, body: body, elif_conds: [], elif_bodies: [],
+                       else_body: [], for_var: "", for_words: "", func_name: "" }
+    return (stmt, next_i)
+end
+
+fn parse_until(lines: [string], at: int) -> (Stmt, int) is
+    let (cond, has_do) = extract_header(lines[at], "until", "do")
+    let mut body_start = at + 1
+    if !has_do is body_start = skip_bare_marker(lines, at + 1, "do") end
+    let (body, stop_at) = parse_block(lines, body_start, ["done"])
+    let mut next_i = stop_at
+    if next_i < lines.len() is next_i = next_i + 1 end
+    let stmt = Stmt { kind: "until", text: cond, body: body, elif_conds: [], elif_bodies: [],
+                       else_body: [], for_var: "", for_words: "", func_name: "" }
+    return (stmt, next_i)
+end
+
+;; `for VAR in WORDS; do ... done`
+fn parse_for(lines: [string], at: int) -> (Stmt, int) is
+    let (header, has_do) = extract_header(lines[at], "for", "do")
+    let in_idx = header.index_of(" in ")
+    let mut var_name = header
+    let mut words_text = ""
+    if in_idx >= 0 is
+        var_name = header[0..in_idx].trim()
+        words_text = header[in_idx + 4..header.len()].trim()
+    end
+    let mut body_start = at + 1
+    if !has_do is body_start = skip_bare_marker(lines, at + 1, "do") end
+    let (body, stop_at) = parse_block(lines, body_start, ["done"])
+    let mut next_i = stop_at
+    if next_i < lines.len() is next_i = next_i + 1 end
+    let stmt = Stmt { kind: "for", text: "", body: body, elif_conds: [], elif_bodies: [],
+                       else_body: [], for_var: var_name, for_words: words_text, func_name: "" }
+    return (stmt, next_i)
+end
+
+;; `function NAME { ... }` / `function NAME\n{ ... }`
+fn parse_func_def(lines: [string], at: int) -> (Stmt, int) is
+    let header = lines[at].trim()
+    let after = header[8..header.len()].trim()   ;; strip "function"
+    let mut name = after
+    let brace_idx = after.index_of("{")
+    if brace_idx >= 0 is name = after[0..brace_idx].trim() end
+    let mut body_start = at + 1
+    if brace_idx >= 0 is body_start = at + 1 end
+    if brace_idx < 0 is body_start = skip_bare_marker(lines, at + 1, "{") end
+    let (body, stop_at) = parse_block(lines, body_start, ["}"])
+    let mut next_i = stop_at
+    if next_i < lines.len() is next_i = next_i + 1 end
+    let stmt = Stmt { kind: "func_def", text: "", body: body, elif_conds: [], elif_bodies: [],
+                       else_body: [], for_var: "", for_words: "", func_name: name }
+    return (stmt, next_i)
+end
+
+;; `NAME() { ... }`
+fn parse_func_paren_def(lines: [string], at: int) -> (Stmt, int) is
+    let header = lines[at].trim()
+    let paren = header.index_of("()")
+    let name = header[0..paren].trim()
+    let after = header[paren + 2..header.len()].trim()
+    let mut body_start = at + 1
+    if after.starts_with("{") is body_start = at + 1 end
+    if !after.starts_with("{") is body_start = skip_bare_marker(lines, at + 1, "{") end
+    let (body, stop_at) = parse_block(lines, body_start, ["}"])
+    let mut next_i = stop_at
+    if next_i < lines.len() is next_i = next_i + 1 end
+    let stmt = Stmt { kind: "func_def", text: "", body: body, elif_conds: [], elif_bodies: [],
+                       else_body: [], for_var: "", for_words: "", func_name: name }
+    return (stmt, next_i)
+end
+
+;; ── Shell state ──────────────────────────────────────────────────────────
+
+struct Shell is
+    pub v: any               ;; vars::ShellVars
+    pub aliases: any          ;; hashmap
+    pub theme_name: string
+    pub last_dir: string
+    pub history_file: string
+    pub running: bool
+    pub jobs: jobs::JobTable
+    pub functions: any        ;; hashmap: name -> body text (newline-joined)
+    pub control: string        ;; "" | "break" | "continue" | "return"
+    pub shell_depth: int
+    pub restricted: bool
+    pub denied_commands: [string]
+    pub confirm_dangerous: bool
+    pub last_duration_ms: int
+end
+
+pub fn shell_new(shell_pid: int) -> Shell is
+    return Shell {
+        v: vars::vars_new(shell_pid), aliases: hashmap_new(), theme_name: "hacker",
+        last_dir: "", history_file: "", running: true, jobs: jobs::jobs_new(),
+        functions: hashmap_new(), control: "", shell_depth: 0, restricted: false,
+        denied_commands: [], confirm_dangerous: true, last_duration_ms: -1,
+    }
+end
+
+fn with_exit(mut sh: Shell, code: int) -> Shell is
+    sh.v.last_exit = code
+    return sh
+end
+
+;; ── external command execution ──────────────────────────────────────────
+;; See the module doc comment: builtins are intercepted in-process
+;; (they must mutate shell state); everything else is handed whole to
+;; `process::run()`, which runs it via a real `sh -c` — so pipes,
+;; redirects, globbing, `&&`/`||`/`;`, and subshells all work
+;; correctly, just via the *system* shell.
+;;
+;; EXIT CODES: `process::run()` gives none. This file recovers one
+;; anyway by appending a marker the real `sh` prints after the
+;; command finishes (`; echo HSHEXIT:$?`) and parsing it back out of
+;; the captured output before printing — invisible to the user, and
+;; accurate for `if`/`while`/`&&`-style scripting that needs a real
+;; exit code, at the cost of one extra `echo` per external command.
+
+fn run_external_capture(cmd: string) -> (string, int) is
+    let marker = "\x1eHSHEXIT:"
+    let wrapped = cmd + "; printf '" + marker + "%d\\n' \"$?\""
+    let raw = proc::run(wrapped)
+    let idx = raw.index_of(marker)
+    if idx < 0 is return (raw, 0) end
+    let before = raw[0..idx]
+    let after = raw[idx + marker.len()..raw.len()].trim()
+    let mut code = 0
+    if util::is_all_digits(after) is code = after.parse_int() end
+    return (before, code)
+end
+
+pub fn run_external(mut sh: Shell, cmd: string) -> Shell is
+    let (out, code) = run_external_capture(cmd)
+    util::write_raw(out)
+    return with_exit(sh, code)
+end
+
+;; ── condition evaluation (for if/while/until) ───────────────────────────
+;; Runs `cond_text` as a full command (builtin-or-external, same path
+;; as any other line) and returns its exit code (0 = true, matching
+;; shell convention) together with the updated shell.
+
+pub fn eval_condition(mut sh: Shell, hist: any, cond_text: string) -> (Shell, bool) is
+    let expanded = vars::expand_line(sh.v, vars::expand_alias(sh.aliases, cond_text))
+    sh = dispatch_line(sh, hist, expanded)
+    return (sh, sh.v.last_exit == 0)
+end
+
+;; ── builtins ─────────────────────────────────────────────────────────────
+;; Ported from builtins.rs, folded into this file — see the module doc
+;; comment for why. `builtins_native.rs`'s reimplementations of `ls`/
+;; `cat`/`grep`/etc are intentionally NOT ported: those already work
+;; via `run_external` using the real system binaries.
+
+fn builtin_cd(mut sh: Shell, arg: string) -> Shell is
+    let home = util::getenv_safe("HOME")
+    let cur = fs::cwd()
+    let mut target = arg.trim()
+    if target == "" is target = home end
+    if target == "-" is
+        if sh.last_dir == "" is
+            write("cd: OLDPWD not set")
+            return with_exit(sh, 1)
+        end
+        target = sh.last_dir
+        write(target)
+    end
+    if target == "~" is target = home end
+    if target.starts_with("~/") is target = home + target[1..target.len()] end
+
+    if !fs::exists(target) is
+        write("cd: no such file or directory: " + target)
+        return with_exit(sh, 1)
+    end
+    if !fs::is_dir(target) is
+        write("cd: not a directory: " + target)
+        return with_exit(sh, 1)
+    end
+    fs::chdir(target)
+    sh.last_dir = cur
+    sh.v = vars::vars_set(sh.v, "PWD", fs::cwd())
+    return with_exit(sh, 0)
+end
+
+fn builtin_export(mut sh: Shell, arg: string) -> Shell is
+    let trimmed = arg.trim()
+    if trimmed == "" is
+        print_exported(sh.v)
+        return with_exit(sh, 0)
+    end
+    let eq = trimmed.index_of("=")
+    if eq < 0 is
+        sh.v.exported.insert(trimmed, "1")
+        return with_exit(sh, 0)
+    end
+    let name = trimmed[0..eq]
+    let value = vars::expand_line(sh.v, util::strip_quotes(trimmed[eq + 1..trimmed.len()]))
+    sh.v = vars::vars_export(sh.v, name, value)
+    return with_exit(sh, 0)
+end
+
+fn print_exported(v: any) is
+    let keys = v.exported.keys()
+    let mut i = 0
+    while i < keys.len() is
+        let cur = i
+        i = i + 1
+        let k = to_string(keys[cur])
+        write("export " + k + "=" + vars::vars_get(v, k))
+    end
+end
+
+fn builtin_unset(mut sh: Shell, arg: string) -> Shell is
+    sh.v = vars::vars_unset(sh.v, arg.trim())
+    return with_exit(sh, 0)
+end
+
+fn builtin_readonly(mut sh: Shell, arg: string) -> Shell is
+    let trimmed = arg.trim()
+    let eq = trimmed.index_of("=")
+    if eq >= 0 is
+        let name = trimmed[0..eq]
+        let value = vars::expand_line(sh.v, util::strip_quotes(trimmed[eq + 1..trimmed.len()]))
+        sh.v = vars::vars_set(sh.v, name, value)
+    end
+    let mut name_only = trimmed
+    if eq >= 0 is name_only = trimmed[0..eq] end
+    sh.v.readonly.insert(name_only, "1")
+    return with_exit(sh, 0)
+end
+
+fn builtin_alias(mut sh: Shell, arg: string) -> Shell is
+    let trimmed = arg.trim()
+    if trimmed == "" is
+        print_aliases(sh.aliases)
+        return with_exit(sh, 0)
+    end
+    let eq = trimmed.index_of("=")
+    if eq < 0 is
+        write("alias " + trimmed + "='" + vars::alias_get(sh.aliases, trimmed) + "'")
+        return with_exit(sh, 0)
+    end
+    let name = trimmed[0..eq]
+    let value = util::strip_quotes(trimmed[eq + 1..trimmed.len()])
+    sh.aliases = vars::alias_set(sh.aliases, name, value)
+    return with_exit(sh, 0)
+end
+
+fn print_aliases(aliases: any) is
+    let keys = aliases.keys()
+    let mut i = 0
+    while i < keys.len() is
+        let cur = i
+        i = i + 1
+        let k = to_string(keys[cur])
+        write("alias " + k + "='" + vars::alias_get(aliases, k) + "'")
+    end
+end
+
+fn builtin_unalias(mut sh: Shell, arg: string) -> Shell is
+    sh.aliases = vars::alias_remove(sh.aliases, arg.trim())
+    return with_exit(sh, 0)
+end
+
+fn builtin_set(mut sh: Shell, arg: string) -> Shell is
+    let trimmed = arg.trim()
+    if trimmed == "-e" is sh.v.opt_errexit = true end
+    if trimmed == "+e" is sh.v.opt_errexit = false end
+    if trimmed == "-x" is sh.v.opt_xtrace = true end
+    if trimmed == "+x" is sh.v.opt_xtrace = false end
+    if trimmed == "-u" is sh.v.opt_nounset = true end
+    if trimmed == "+u" is sh.v.opt_nounset = false end
+    return with_exit(sh, 0)
+end
+
+fn builtin_which(sh: Shell, arg: string) -> Shell is
+    let name = arg.trim()
+    if sh.aliases.contains_key(name) is
+        write(name + ": aliased to " + vars::alias_get(sh.aliases, name))
+        return sh
+    end
+    if sh.functions.contains_key(name) is
+        write(name + ": function")
+        return sh
+    end
+    let path = proc::which(name)
+    if path == "" is
+        write(name + ": not found")
+        return with_exit(sh, 1)
+    end
+    write(path)
+    return with_exit(sh, 0)
+end
+
+pub fn builtin_help_public() is
+    builtin_help()
+end
+
+fn builtin_help() is
+    write("hsh (H# port) — built-in commands:")
+    write("  cd [dir|-]              zmień katalog")
+    write("  pwd                     bieżący katalog")
+    write("  exit [code]             wyjdź z powłoki")
+    write("  export NAME[=val]       eksportuj zmienną")
+    write("  unset NAME              usuń zmienną")
+    write("  readonly NAME[=val]     ustaw zmienną tylko-do-odczytu")
+    write("  alias [name[=val]]      ustaw/pokaż alias")
+    write("  unalias name            usuń alias")
+    write("  history                 pokaż historię")
+    write("  which/type name         znajdź polecenie")
+    write("  set -e|-x|-u            przełącz opcje powłoki")
+    write("  source/. file           uruchom plik skryptu")
+    write("  theme [name]            pokaż/zmień motyw")
+    write("  jobs                    lista zadań w tle")
+    write("  fg/bg/stop/kill %N      kontrola zadań (best-effort)")
+    write("  pushd/popd/dirs         stos katalogów")
+    write("  true / false / :        polecenia no-op")
+    write("  read NAME               wczytaj linię do zmiennej")
+    write("  eval STRING             wykonaj sklejoną komendę")
+    write("  help                    ten tekst")
+    write("")
+    write("Skrypty źródłowane przez source/. obsługują:")
+    write("  if/elif/else/fi, while/do/done, until/do/done,")
+    write("  for VAR in LISTA; do/done, function NAZWA " + "{{ }}, break, continue, return")
+    write("")
+    write("Wszystko inne jest uruchamiane jako polecenie zewnętrzne przez system shell.")
+end
+
+fn builtin_pushd(mut sh: Shell, arg: string) -> Shell is
+    let target = arg.trim()
+    if target == "" is
+        write("pushd: brak katalogu")
+        return with_exit(sh, 1)
+    end
+    let cur = fs::cwd()
+    let stack = vars::vars_get(sh.v, "__DIRSTACK__")
+    let mut new_stack = cur
+    if stack != "" is new_stack = cur + "\n" + stack end
+    if !fs::is_dir(target) is
+        write("pushd: nie znaleziono katalogu: " + target)
+        return with_exit(sh, 1)
+    end
+    fs::chdir(target)
+    sh.v = vars::vars_set(sh.v, "__DIRSTACK__", new_stack)
+    builtin_dirs(sh)
+    return with_exit(sh, 0)
+end
+
+fn builtin_popd(mut sh: Shell) -> Shell is
+    let stack = vars::vars_get(sh.v, "__DIRSTACK__")
+    if stack == "" is
+        write("popd: stos katalogów jest pusty")
+        return with_exit(sh, 1)
+    end
+    let nl = stack.index_of("\n")
+    let mut top = stack
+    let mut rest = ""
+    if nl >= 0 is
+        top = stack[0..nl]
+        rest = stack[nl + 1..stack.len()]
+    end
+    fs::chdir(top)
+    sh.v = vars::vars_set(sh.v, "__DIRSTACK__", rest)
+    builtin_dirs(sh)
+    return with_exit(sh, 0)
+end
+
+fn builtin_dirs(sh: Shell) is
+    let stack = vars::vars_get(sh.v, "__DIRSTACK__")
+    let mut line = fs::cwd()
+    if stack != "" is
+        let parts = stack.split("\n")
+        let mut i = 0
+        while i < parts.len() is
+            let cur = i
+            i = i + 1
+            line = line + " " + parts[cur]
+        end
+    end
+    write(line)
+end
+
+fn builtin_jobs(sh: Shell) -> Shell is
+    jobs::jobs_list(sh.jobs)
+    return sh
+end
+
+fn builtin_fg(mut sh: Shell, arg: string) -> Shell is
+    let id = parse_job_id(arg)
+    if id < 0 is
+        write("fg: nieprawidłowy numer zadania")
+        return with_exit(sh, 1)
+    end
+    let pid = jobs::jobs_fg_pid(sh.jobs, id)
+    if pid < 0 is
+        write("fg: brak takiego zadania")
+        return with_exit(sh, 1)
+    end
+    write("[" + to_string(id) + "] " + to_string(pid) + " (best-effort — brak prawdziwego przekazania terminala, patrz README.md)")
+    return with_exit(sh, 0)
+end
+
+fn builtin_bg(mut sh: Shell, arg: string) -> Shell is
+    let id = parse_job_id(arg)
+    if id < 0 is
+        write("bg: nieprawidłowy numer zadania")
+        return with_exit(sh, 1)
+    end
+    jobs::jobs_bg(sh.jobs, id)
+    return with_exit(sh, 0)
+end
+
+fn builtin_stop(mut sh: Shell, arg: string) -> Shell is
+    let id = parse_job_id(arg)
+    if id < 0 is
+        write("stop: nieprawidłowy numer zadania")
+        return with_exit(sh, 1)
+    end
+    jobs::jobs_stop(sh.jobs, id)
+    return with_exit(sh, 0)
+end
+
+fn builtin_kill(mut sh: Shell, arg: string) -> Shell is
+    let trimmed = arg.trim()
+    if trimmed.starts_with("%") is
+        let id = parse_job_id(trimmed)
+        if id < 0 is
+            write("kill: nieprawidłowy numer zadania")
+            return with_exit(sh, 1)
+        end
+        jobs::jobs_send_signal(sh.jobs, id, "TERM")
+        return with_exit(sh, 0)
+    end
+    proc::run("kill " + trimmed)
+    return with_exit(sh, 0)
+end
+
+fn builtin_wait(mut sh: Shell) -> Shell is
+    sh.jobs = jobs::jobs_check_finished(sh.jobs)
+    return with_exit(sh, 0)
+end
+
+fn parse_job_id(arg: string) -> int is
+    let mut t = arg.trim()
+    if t.starts_with("%") is t = t[1..t.len()] end
+    if !util::is_all_digits(t) is return -1 end
+    return t.parse_int()
+end
+
+fn builtin_theme(mut sh: Shell, arg: string) -> Shell is
+    let trimmed = arg.trim()
+    if trimmed == "" is
+        write("aktualny motyw: " + sh.theme_name)
+        write("dostępne: " + theme::theme_names().join(", "))
+        return with_exit(sh, 0)
+    end
+    sh.theme_name = trimmed
+    return with_exit(sh, 0)
+end
+
+fn builtin_hsh_audit(sh: Shell, arg: string) -> Shell is
+    let home = util::getenv_safe("HOME")
+    let result = security::verify_audit_log(home)
+    if result.ok is
+        write("dziennik audytu: OK (" + to_string(result.count) + " wpisów, łańcuch nienaruszony)")
+        return sh
+    end
+    write("dziennik audytu: USZKODZONY od linii " + to_string(result.broken_at))
+    return with_exit(sh, 1)
+end
+
+fn builtin_hsh_version() is
+    write("hsh (H# port) 0.1.0")
+end
+
+;; ── statement executor (script control flow) ────────────────────────────
+;; `sh.control` carries a break/continue/return signal up through the
+;; call stack: "" (normal), "break", "continue", "return". Loops
+;; consume break/continue (clearing `sh.control` back to ""); function
+;; calls consume "return". Every statement handler here returns `sh`
+;; from *inside* whichever branch actually ran — see the module doc
+;; comment's note on the interpreter bug this avoids.
+
+pub fn exec_stmt_list(mut sh: Shell, hist: any, stmts: [Stmt]) -> Shell is
+    let mut i = 0
+    let mut stop = false
+    while i < stmts.len() && !stop is
+        let cur = i
+        i = i + 1
+        sh = exec_stmt(sh, hist, stmts[cur])
+        if sh.control != "" is stop = true end
+    end
+    return sh
+end
+
+fn exec_stmt(mut sh: Shell, hist: any, stmt: Stmt) -> Shell is
+    if stmt.kind == "cmd" is return exec_cmd_stmt(sh, hist, stmt.text) end
+    if stmt.kind == "assign" is return exec_assign_stmt(sh, stmt.text) end
+    if stmt.kind == "if" is return exec_if_stmt(sh, hist, stmt) end
+    if stmt.kind == "while" is return exec_while_stmt(sh, hist, stmt) end
+    if stmt.kind == "until" is return exec_until_stmt(sh, hist, stmt) end
+    if stmt.kind == "for" is return exec_for_stmt(sh, hist, stmt) end
+    if stmt.kind == "func_def" is return exec_func_def_stmt(sh, stmt) end
+    if stmt.kind == "break" is
+        sh.control = "break"
+        return sh
+    end
+    if stmt.kind == "continue" is
+        sh.control = "continue"
+        return sh
+    end
+    if stmt.kind == "return" is
+        let mut code = sh.v.last_exit
+        if stmt.text.trim() != "" is
+            if util::is_all_digits(stmt.text.trim()) is code = stmt.text.trim().parse_int() end
+        end
+        sh.v.last_exit = code
+        sh.control = "return"
+        return sh
+    end
+    return sh
+end
+
+fn exec_assign_stmt(mut sh: Shell, text: string) -> Shell is
+    let eq = text.index_of("=")
+    let name = text[0..eq]
+    let value = vars::expand_line(sh.v, util::strip_quotes(text[eq + 1..text.len()]))
+    sh.v = vars::vars_set(sh.v, name, value)
+    return with_exit(sh, 0)
+end
+
+fn exec_cmd_stmt(mut sh: Shell, hist: any, text: string) -> Shell is
+    let expanded = vars::expand_line(sh.v, vars::expand_alias(sh.aliases, text))
+    sh = dispatch_line(sh, hist, expanded)
+    if sh.v.opt_errexit is
+        if sh.v.last_exit != 0 is sh.control = "return" end
+    end
+    return sh
+end
+
+fn exec_if_stmt(mut sh: Shell, hist: any, stmt: Stmt) -> Shell is
+    let (sh1, matched) = eval_condition(sh, hist, stmt.text)
+    sh = sh1
+    if matched is
+        return exec_stmt_list(sh, hist, stmt.body)
+    end
+    return exec_if_elifs(sh, hist, stmt, 0)
+end
+
+fn exec_if_elifs(mut sh: Shell, hist: any, stmt: Stmt, idx: int) -> Shell is
+    if idx >= stmt.elif_conds.len() is
+        return exec_stmt_list(sh, hist, stmt.else_body)
+    end
+    let (sh1, matched) = eval_condition(sh, hist, stmt.elif_conds[idx])
+    sh = sh1
+    if matched is
+        return exec_stmt_list(sh, hist, stmt.elif_bodies[idx])
+    end
+    return exec_if_elifs(sh, hist, stmt, idx + 1)
+end
+
+fn exec_while_stmt(mut sh: Shell, hist: any, stmt: Stmt) -> Shell is
+    let mut going = true
+    while going is
+        let (sh1, matched) = eval_condition(sh, hist, stmt.text)
+        sh = sh1
+        if !matched is going = false end
+        if matched is
+            sh = exec_stmt_list(sh, hist, stmt.body)
+            if sh.control == "break" is
+                sh.control = ""
+                going = false
+            end
+            if sh.control == "continue" is sh.control = "" end
+            if sh.control == "return" is going = false end
+        end
+    end
+    return sh
+end
+
+fn exec_until_stmt(mut sh: Shell, hist: any, stmt: Stmt) -> Shell is
+    let mut going = true
+    while going is
+        let (sh1, matched) = eval_condition(sh, hist, stmt.text)
+        sh = sh1
+        if matched is going = false end
+        if !matched is
+            sh = exec_stmt_list(sh, hist, stmt.body)
+            if sh.control == "break" is
+                sh.control = ""
+                going = false
+            end
+            if sh.control == "continue" is sh.control = "" end
+            if sh.control == "return" is going = false end
+        end
+    end
+    return sh
+end
+
+fn exec_for_stmt(mut sh: Shell, hist: any, stmt: Stmt) -> Shell is
+    let expanded_words = vars::expand_line(sh.v, stmt.for_words)
+    let words = split_ws(expanded_words)
+    let mut i = 0
+    let mut going = true
+    while i < words.len() && going is
+        let cur = i
+        i = i + 1
+        sh.v = vars::vars_set(sh.v, stmt.for_var, words[cur])
+        sh = exec_stmt_list(sh, hist, stmt.body)
+        if sh.control == "break" is
+            sh.control = ""
+            going = false
+        end
+        if sh.control == "continue" is sh.control = "" end
+        if sh.control == "return" is going = false end
+    end
+    return sh
+end
+
+fn split_ws(s: string) -> [string] is
+    return __builtin_str_split_whitespace(s)
+end
+
+fn exec_func_def_stmt(mut sh: Shell, stmt: Stmt) -> Shell is
+    sh.functions.insert(stmt.func_name, stmt.body)
+    return with_exit(sh, 0)
+end
+
+;; Calls a user-defined function: sets positional params ($1, $2, ...)
+;; from `args`, runs the body, restores the caller's positional
+;; params afterward, and consumes a "return" signal (so it doesn't
+;; propagate past the function boundary).
+fn call_function(mut sh: Shell, hist: any, name: string, args: [string]) -> Shell is
+    ;; BUG FIX (H-Sharp compiler side): was `sh.functions.get(name)`.
+    ;; `.get(...)` method-call syntax is ambiguous between an array's
+    ;; `.get(index)` and a hashmap's `.get(key)` (nothing at codegen
+    ;; time knows which `sh.functions` is — `any` is opaque by design),
+    ;; so this now calls the unambiguous native `map_get(...)` builtin
+    ;; directly. Deliberately `map_get`, not `map_get_str`: a function's
+    ;; body is a `[Stmt]` array (see `sh.functions.insert(stmt.func_name,
+    ;; stmt.body)` below), not a string, and `map_get` returns the
+    ;; generic value untyped (coerced to whatever the call site actually
+    ;; needs) rather than `map_get_str`'s string-specific reinterpretation.
+    let body = map_get(sh.functions, name)
+    let saved_positional = sh.v.positional
+    sh.v.positional = args
+    sh = exec_stmt_list(sh, hist, body)
+    if sh.control == "return" is sh.control = "" end
+    sh.v.positional = saved_positional
+    return sh
+end
+
+;; ── main dispatch ────────────────────────────────────────────────────────
+
+fn builtin_eval(mut sh: Shell, hist: any, arg: string) -> Shell is
+    let expanded = vars::expand_line(sh.v, arg)
+    return dispatch_line(sh, hist, expanded)
+end
+
+fn builtin_read(mut sh: Shell, arg: string) -> Shell is
+    let name = arg.trim()
+    let val = io::read_line("")
+    if name != "" is sh.v = vars::vars_set(sh.v, name, val) end
+    return with_exit(sh, 0)
+end
+
+;; Dispatches one already alias/var/tilde/arithmetic-expanded line:
+;; builtin, else a user-defined function, else delegate externally
+;; (through the security checks). This is the single entry point every
+;; other executor above funnels into for a leaf command.
+pub fn dispatch_line(mut sh: Shell, hist: any, line: string) -> Shell is
+    let trimmed = line.trim()
+    if trimmed == "" is return sh end
+
+    let cmd = util::first_word(trimmed)
+    let arg = util::rest_after_first_word(trimmed)
+
+    if cmd == "cd" is return builtin_cd(sh, arg) end
+    if cmd == "pwd" is
+        write(fs::cwd())
+        return with_exit(sh, 0)
+    end
+    if cmd == "exit" is
+        sh.running = false
+        let mut code = 0
+        if arg.trim() != "" is
+            if util::is_all_digits(arg.trim()) is code = arg.trim().parse_int() end
+        end
+        return with_exit(sh, code)
+    end
+    if cmd == "export" is return builtin_export(sh, arg) end
+    if cmd == "unset" is return builtin_unset(sh, arg) end
+    if cmd == "readonly" is return builtin_readonly(sh, arg) end
+    if cmd == "declare" is return builtin_export(sh, arg) end
+    if cmd == "typeset" is return builtin_export(sh, arg) end
+    if cmd == "local" is return exec_assign_stmt(sh, arg) end
+    if cmd == "alias" is return builtin_alias(sh, arg) end
+    if cmd == "unalias" is return builtin_unalias(sh, arg) end
+    if cmd == "set" is return builtin_set(sh, arg) end
+    if cmd == "history" is
+        util::write_raw("")
+        return with_exit(sh, 0)   ;; real history display is wired in main.h# (has the hp::History)
+    end
+    if cmd == "which" is return builtin_which(sh, arg) end
+    if cmd == "type" is return builtin_which(sh, arg) end
+    if cmd == "help" is
+        builtin_help()
+        return with_exit(sh, 0)
+    end
+    if cmd == "true" is return with_exit(sh, 0) end
+    if cmd == "false" is return with_exit(sh, 1) end
+    if cmd == ":" is return with_exit(sh, 0) end
+    if cmd == "theme" is return builtin_theme(sh, arg) end
+    if cmd == "read" is return builtin_read(sh, arg) end
+    if cmd == "eval" is return builtin_eval(sh, hist, arg) end
+    if cmd == "pushd" is return builtin_pushd(sh, arg) end
+    if cmd == "popd" is return builtin_popd(sh) end
+    if cmd == "dirs" is
+        builtin_dirs(sh)
+        return with_exit(sh, 0)
+    end
+    if cmd == "jobs" is return builtin_jobs(sh) end
+    if cmd == "fg" is return builtin_fg(sh, arg) end
+    if cmd == "bg" is return builtin_bg(sh, arg) end
+    if cmd == "stop" is return builtin_stop(sh, arg) end
+    if cmd == "kill" is return builtin_kill(sh, arg) end
+    if cmd == "wait" is return builtin_wait(sh) end
+    if cmd == "hsh-audit" is return builtin_hsh_audit(sh, arg) end
+    if cmd == "hsh-version" is
+        builtin_hsh_version()
+        return with_exit(sh, 0)
+    end
+    if cmd == "source" is return run_script_file(sh, hist, arg.trim()) end
+    if cmd == "." is return run_script_file(sh, hist, arg.trim()) end
+
+    if sh.functions.contains_key(cmd) is
+        return call_function(sh, hist, cmd, split_ws(arg))
+    end
+
+    return dispatch_external(sh, trimmed, cmd, arg)
+end
+
+;; The non-builtin, non-function fallback: restricted-mode / denied-
+;; command / dangerous-command checks, then `run_external`.
+fn dispatch_external(mut sh: Shell, trimmed: string, cmd: string, arg: string) -> Shell is
+    if sh.restricted is
+        let violation = security::restricted_violation(trimmed)
+        if violation != "" is
+            write("hsh: zablokowane w trybie restricted: " + violation)
+            return with_exit(sh, 1)
+        end
+    end
+
+    let denied_hit = security::is_denied_command(trimmed, sh.denied_commands)
+    if denied_hit != "" is
+        write("hsh: polecenie zablokowane w konfiguracji: " + denied_hit)
+        return with_exit(sh, 1)
+    end
+
+    if sh.confirm_dangerous is
+        let ok = security::confirm_dangerous(trimmed)
+        if !ok is
+            write("przerwano")
+            return with_exit(sh, 1)
+        end
+    end
+
+    return run_external(sh, trimmed)
+end
+
+;; ── script file execution (source / .) ──────────────────────────────────
+
+pub fn run_script_file(mut sh: Shell, hist: any, path: string) -> Shell is
+    if !fs::exists(path) is
+        write("hsh: " + path + ": nie znaleziono pliku")
+        return with_exit(sh, 1)
+    end
+    let lines = fs::read_lines(path)
+    let (stmts, _stop) = parse_block(lines, 0, [])
+    return exec_stmt_list(sh, hist, stmts)
+end
