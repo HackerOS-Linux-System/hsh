@@ -1,0 +1,291 @@
+use "std -> regex" from "re"
+use "std -> fs"    from "fs"
+use "std -> io"    from "io"
+use "std -> hash"  from "hash"
+use "std -> process" from "proc"
+mod util
+;; severity: "critical" | "high" (plain string tag — see README.md's
+;; porting notes on tagged-struct-instead-of-enum in this codebase)
+
+struct DangerHit is
+    pub matched: bool
+    pub severity: string
+    pub message: string
+end
+
+struct DangerRule is
+    pub pattern: string
+    pub message: string
+    pub severity: string
+end
+
+pub fn danger_rules() -> [DangerRule] is
+    return [
+        DangerRule { pattern: "\\brm\\s+(-\\S*\\s+)*-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+/(\\s|$)",
+                     message: "To usunie WSZYSTKIE pliki w systemie (rm -rf /)!", severity: "critical" },
+        DangerRule { pattern: "\\brm\\s+(-\\S*\\s+)*-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\\s+/(\\s|$)",
+                     message: "To usunie WSZYSTKIE pliki w systemie (rm -fr /)!", severity: "critical" },
+        DangerRule { pattern: "\\brm\\s+(-\\S*\\s+)*-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+/\\*",
+                     message: "To usunie WSZYSTKIE pliki w katalogu głównym systemu!", severity: "critical" },
+        DangerRule { pattern: "\\brm\\s+(-\\S*\\s+)*-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+~/?(\\s|$)",
+                     message: "To bezpowrotnie usunie cały katalog domowy!", severity: "high" },
+        DangerRule { pattern: "\\brm\\s+(-\\S*\\s+)*-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\\s+\\.\\.?(/\\S*)?(\\s|$)",
+                     message: "To rekurencyjnie usunie bieżący/nadrzędny katalog!", severity: "high" },
+        DangerRule { pattern: "\\bdd\\s+.*\\bof=/dev/(sd|nvme|hd|vd|xvd)",
+                     message: "To nadpisze surowe dane na dysku (dd of=/dev/...)!", severity: "critical" },
+        DangerRule { pattern: "\\bmkfs(\\.\\w+)?\\s+.*?/dev/",
+                     message: "To sformatuje partycję/dysk — utrata wszystkich danych!", severity: "critical" },
+        DangerRule { pattern: "\\bchmod\\s+(-R\\s+)?0?777\\s+/(\\s|$)",
+                     message: "To nada wszystkim prawa zapisu do całego systemu plików!", severity: "high" },
+        DangerRule { pattern: ":\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:\\s*&?\\s*\\}\\s*;\\s*:",
+                     message: "FORK BOMBA — to zawiesi/zrestartuje system!", severity: "critical" },
+        DangerRule { pattern: ">\\s*/dev/(sd|nvme|hd|vd|xvd)[a-z0-9]*(\\s|$)",
+                     message: "To nadpisze surowe dane na urządzeniu blokowym!", severity: "critical" },
+        DangerRule { pattern: "(curl|wget)\\s+[^|;]*\\|\\s*(sudo\\s+)?(sh|bash|zsh|hsh)\\b",
+                     message: "Uruchamiasz kod pobrany z sieci bez wcześniejszej weryfikacji!", severity: "high" },
+        DangerRule { pattern: "\\bgit\\s+push\\b[^|;&]*(--force(-with-lease)?\\b|(^|\\s)-f(\\s|$))",
+                     message: "Force push może bezpowrotnie nadpisać historię zdalnego repozytorium!", severity: "high" },
+        DangerRule { pattern: "\\bchown\\s+(-R\\s+)?\\S+\\s+/(\\s|$)",
+                     message: "To zmieni właściciela całego systemu plików!", severity: "high" },
+        DangerRule { pattern: "\\bshred\\s+(-\\S+\\s+)*-[a-zA-Z]*u",
+                     message: "To bezpowrotnie zniszczy dane na dysku (shred -u)!", severity: "high" },
+        DangerRule { pattern: "\\bmv\\s+/\\*\\s+/dev/null",
+                     message: "To przeniesie (zniszczy) wszystkie pliki systemu!", severity: "critical" },
+    ]
+end
+
+pub fn check_dangerous(input: string) -> DangerHit is
+    let rules = danger_rules()
+    let mut i = 0
+    let mut hit = DangerHit { matched: false, severity: "", message: "" }
+    while i < rules.len() is
+        let cur = i
+        i = i + 1
+        if re::is_match(input, rules[cur].pattern) is
+            hit = DangerHit { matched: true, severity: rules[cur].severity, message: rules[cur].message }
+        end
+    end
+    return hit
+end
+
+;; Prints the warning + reads confirmation itself; returns true if the
+;; command may proceed. High severity needs "yes" typed; Critical
+;; needs the *exact original command* retyped (protects against a
+;; reflexive Enter/paste of "yes" without reading the warning) — same
+;; behavior as the original.
+pub fn confirm_dangerous(input: string) -> bool is
+    let hit = check_dangerous(input)
+    if !hit.matched is return true end
+
+    if hit.severity == "critical" is
+        write("\x1b[1;31m\xe2\x9a\xa0  KRYTYCZNE: " + hit.message + "\x1b[0m")
+        write("\x1b[1;33mAby kontynuować, przepisz dokładnie poniższą komendę:\x1b[0m")
+        write("\x1b[38;5;244m  " + input.trim() + "\x1b[0m")
+        let answer = io::read_line("> ")
+        return answer.trim() == input.trim()
+    end
+
+    write("\x1b[1;31m\xe2\x9a\xa0  UWAGA: " + hit.message + "\x1b[0m")
+    let answer = io::read_line("\x1b[1;33mCzy na pewno chcesz kontynuować? Wpisz 'yes' aby potwierdzić: \x1b[0m")
+    return answer.trim() == "yes"
+end
+
+;; ── restricted mode ──────────────────────────────────────────────────────
+;; rbash-equivalent: command names can't contain '/' (must resolve via
+;; PATH), and output redirection is blocked. Returns "" if no
+;; violation, else a description.
+
+pub fn restricted_violation(rest: string) -> string is
+    let first = util::first_word(rest)
+    if first != "" is
+        if !first.contains("=") is
+            if first.contains("/") is
+                return "nazwa polecenia nie może zawierać '/' w trybie restricted (użyj PATH)"
+            end
+        end
+    end
+    if re::is_match(rest, ">|<>") is
+        return "przekierowanie wyjścia jest zablokowane w trybie restricted"
+    end
+    return ""
+end
+
+;; ── secret redaction ─────────────────────────────────────────────────────
+;; Protects against accidentally writing passwords/tokens/keys in
+;; plaintext to ~/.hsh_history or the audit log. `sed -E`'s ERE
+;; dialect (no `(?i)`, no `\S`) — see the module doc comment.
+
+pub fn redact_secrets(command: string) -> string is
+    let mut out = command
+    let letter_or = "[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]" +
+                    "|[Pp][Aa][Ss][Ss]|[Tt][Oo][Kk][Ee][Nn]" +
+                    "|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Ss][Ee][Cc][Rr][Ee][Tt]" +
+                    "|[Aa][Cc][Cc][Ee][Ss][Ss][_-]?[Kk][Ee][Yy]"
+    out = re::replace_all(out, "(--?(" + letter_or + ")[= ])[^[:space:]]+", "\\1[REDACTED]")
+    out = re::replace_all(out, "(AKIA[0-9A-Z]" + "{{16}})", "[REDACTED]")
+    out = re::replace_all(out,
+        "([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*([Bb][Ee][Aa][Rr][Ee][Rr]|[Bb][Aa][Ss][Ii][Cc])[[:space:]]+)[^[:space:]]+",
+        "\\1[REDACTED]")
+    out = re::replace_all(out, "([a-zA-Z]+://[^/[:space:]:]+:)[^@[:space:]]+(@)", "\\1[REDACTED]\\2")
+    out = re::replace_all(out, "-----BEGIN [A-Z ]*PRIVATE KEY-----", "-----BEGIN [REDACTED] PRIVATE KEY-----")
+    return out
+end
+
+;; ── PATH hijack risk ─────────────────────────────────────────────────────
+;; `.` in PATH, or (best-effort — H# has no direct `stat` mode/
+;; world-writable check exposed, so this shells out to `find` with
+;; `-perm`) a world-writable-without-sticky-bit directory.
+
+pub fn check_path_hijack_risks(path_var: string) -> [string] is
+    let mut warnings: [string] = []
+    let dirs = path_var.split(":")
+    let mut i = 0
+    while i < dirs.len() is
+        let cur = i
+        i = i + 1
+        let dir = dirs[cur]
+        if dir == "." is
+            warnings.push("PATH zawiera bieżący katalog ('.') — ryzyko podstawienia złośliwego pliku wykonywalnego")
+        end
+        if dir != "." is
+            if dir != "" is
+                if fs::is_dir(dir) is
+                    let out = process_find_world_writable(dir)
+                    if out != "" is
+                        warnings.push("katalog w PATH zapisywalny przez wszystkich (bez sticky bit): " + dir)
+                    end
+                end
+            end
+        end
+    end
+    return warnings
+end
+
+fn process_find_world_writable(dir: string) -> string is
+    ;; `-perm -0002` = world-writable; `! -perm -1000` = sticky bit NOT set
+    return proc::run("find " + dir + " -maxdepth 0 -perm -0002 ! -perm -1000 2>/dev/null").trim()
+end
+
+;; ── hard-denied commands ─────────────────────────────────────────────────
+;; From `[safety] deny_commands` in `~/.hshrc` — unlike
+;; `check_dangerous`, there is no confirmation prompt that gets past
+;; this; it's a flat refusal. Returns the matched basename, or "".
+
+pub fn is_denied_command(rest: string, denied: [string]) -> string is
+    let first = util::first_word(rest)
+    if first == "" is return "" end
+    let slash = first.index_of("/")
+    let mut basename = first
+    if slash >= 0 is
+        ;; last path segment
+        let parts = first.split("/")
+        basename = parts[parts.len() - 1]
+    end
+    let mut i = 0
+    let mut found = ""
+    while i < denied.len() is
+        let cur = i
+        i = i + 1
+        let d = denied[cur].trim()
+        if d == first is found = basename end
+        if d == basename is found = basename end
+    end
+    return found
+end
+
+;; ── audit log (hash chain) ───────────────────────────────────────────────
+;; Each executed line is appended along with a hash depending on the
+;; previous entry's hash — silently editing/removing a line in the
+;; middle breaks the chain from that point on, which `verify_audit_log`
+;; detects. NOT cryptographic protection (`djb2` isn't collision-
+;; resistant against a deliberate attacker) — a lightweight tamper/
+;; corruption detector, same as the original's own doc comment says
+;; about its `DefaultHasher`-based version.
+
+fn audit_log_path(home: string) -> string is
+    if home == "" is return "/root/.hsh-audit.log" end
+    return home + "/.hsh-audit.log"
+end
+
+fn compute_entry_hash(prev_hash: string, ts: int, command: string) -> string is
+    let combined = prev_hash + "\t" + to_string(ts) + "\t" + command
+    return conv_hex16(hash::djb2(combined))
+end
+
+;; zero-padded lowercase hex, 16 chars wide (matches the original's
+;; `{:016x}` formatting of a 64-bit hash, using `hash::djb2`'s 32-bit
+;; range zero-extended — width-compatible with the original's log
+;; format even though the hash algorithm itself differs)
+fn conv_hex16(n: int) -> string is
+    let hex_digits = "0123456789abcdef"
+    let mut v = n
+    if v < 0 is v = 0 - v end
+    let mut out = ""
+    let mut i = 0
+    while i < 16 is
+        i = i + 1
+        let digit = v % 16
+        out = hex_digits[digit..digit + 1] + out
+        v = v / 16
+    end
+    return out
+end
+
+fn last_hash(path: string) -> string is
+    if !fs::exists(path) is return "genesis" end
+    let lines = fs::read_lines(path)
+    if lines.len() == 0 is return "genesis" end
+    let last_line = lines[lines.len() - 1]
+    let parts = last_line.split("\t")
+    if parts.len() < 3 is return "genesis" end
+    return parts[2]
+end
+
+pub fn audit_log(command: string, home: string, now_ts: int) is
+    let path = audit_log_path(home)
+    let prev = last_hash(path)
+    let redacted = redact_secrets(command)
+    let flat = redacted.replace_all("\n", " \xe2\x8f\x8e ")
+    let hash_val = compute_entry_hash(prev, now_ts, flat)
+    let entry = to_string(now_ts) + "\t" + prev + "\t" + hash_val + "\t" + flat + "\n"
+    fs::append(path, entry)
+end
+
+struct AuditVerifyResult is
+    pub ok: bool
+    pub count: int         ;; valid when ok
+    pub broken_at: int     ;; valid when !ok (1-based line number)
+end
+
+pub fn verify_audit_log(home: string) -> AuditVerifyResult is
+    let path = audit_log_path(home)
+    if !fs::exists(path) is return AuditVerifyResult { ok: true, count: 0, broken_at: 0 } end
+    let lines = fs::read_lines(path)
+    let mut prev = "genesis"
+    let mut i = 0
+    let mut broken = 0
+    while i < lines.len() && broken == 0 is
+        let cur = i
+        i = i + 1
+        let parts = lines[cur].split("\t")
+        if parts.len() < 4 is
+            broken = cur + 1
+        end
+        if parts.len() >= 4 is
+            if parts[1] != prev is
+                broken = cur + 1
+            end
+            if broken == 0 is
+                let mut ts_val = 0
+                if util::is_all_digits(parts[0]) is ts_val = parts[0].parse_int() end
+                let expected = compute_entry_hash(parts[1], ts_val, parts[3])
+                if expected != parts[2] is
+                    broken = cur + 1
+                end
+                if broken == 0 is prev = parts[2] end
+            end
+        end
+    end
+    if broken != 0 is return AuditVerifyResult { ok: false, count: 0, broken_at: broken } end
+    return AuditVerifyResult { ok: true, count: lines.len(), broken_at: 0 }
+end
