@@ -1,0 +1,124 @@
+use "std -> sys"        from "sys"
+use "std -> conv"       from "conv"
+mod util
+mod theme
+mod git_info
+fn is_root() -> bool is
+    return sys::get_uid() == 0
+end
+
+pub fn shorten_path(p: string, home: string) -> string is
+    if home != "" is
+        if p == home is return "~" end
+        if p.starts_with(home + "/") is return "~" + p[home.len()..p.len()] end
+    end
+    return p
+end
+
+;; "1m 5s" / "2.3s" / "450ms"
+pub fn format_duration_ms(ms: int) -> string is
+    if ms >= 60000 is
+        let m = ms / 60000
+        let s = (ms % 60000) / 1000
+        return to_string(m) + "m " + to_string(s) + "s"
+    end
+    if ms >= 1000 is
+        let tenths = ms / 100
+        let whole = tenths / 10
+        let frac = tenths % 10
+        return to_string(whole) + "." + to_string(frac) + "s"
+    end
+    return to_string(ms) + "ms"
+end
+
+fn now_time_str() -> string is
+    return __builtin_date_format(__builtin_time_now_unix(), "%H:%M:%S")
+end
+
+;; `last_duration_ms < 0` means "no previous command timed yet" (the
+;; original uses `Option<u128>`; this port uses a sentinel instead —
+;; see README.md's porting notes on why tagged structs/sentinels are
+;; preferred over anything enum-shaped in this codebase).
+pub fn build_prompt(cwd: string, home: string, last_exit_code: int,
+                     last_duration_ms: int, shell_depth: int,
+                     git_info: git_info::GitInfo, theme: theme::Theme) -> string is
+    let rst = theme::theme_reset()
+    let dim = "\x1b[38;5;240m"
+
+    let dir = shorten_path(cwd, home)
+    let time_str = now_time_str()
+
+    ;; ── git segment ──────────────────────────────────────────────────
+    let mut git_seg = ""
+    if git_info.branch != "" is
+        let mut branch_color = theme.git_color
+        if git_info.dirty is
+            branch_color = theme.error_color
+        else is
+            if git_info.ahead > 0 || git_info.behind > 0 is
+                branch_color = "\x1b[38;5;214m"
+            end
+        end
+        let gs = git_info::git_format(git_info, " ", branch_color)
+        if gs != "" is
+            git_seg = "  " + theme.sep + gs + "  "
+        end
+    end
+
+    ;; ── duration segment ─────────────────────────────────────────────
+    let mut dur_seg = ""
+    if last_duration_ms >= 0 is
+        dur_seg = "  " + theme.duration_color + format_duration_ms(last_duration_ms) + rst + "  "
+    end
+
+    ;; ── exit code segment ────────────────────────────────────────────
+    let mut exit_seg = ""
+    if last_exit_code != 0 is
+        exit_seg = "  " + theme.error_color + "\xe2\x9c\x97 [" + to_string(last_exit_code) + "]" + rst + "  "
+    end
+
+    ;; ── root segment ─────────────────────────────────────────────────
+    let mut root_seg = ""
+    if is_root() is
+        root_seg = "  " + theme.error_color + "\xe2\x9a\xa1" + rst + "  "
+    end
+
+    ;; ── depth segment ────────────────────────────────────────────────
+    let mut depth_seg = ""
+    if shell_depth > 0 is
+        depth_seg = "  " + dim + "[" + to_string(shell_depth + 1) + "]" + rst + "  "
+    end
+
+    ;; ── sysinfo segment (only when under load) ──────────────────────
+    let mem_total = sys::memory_total()
+    let mem_used = sys::memory_used()
+    let mut mem_pct = 0
+    if mem_total > 0 is mem_pct = (mem_used * 100) / mem_total end
+    let cores = sys::cpu_count()
+    let load1 = sys::load_avg()
+    let mut cpu_pct = 0
+    if cores > 0 is cpu_pct = conv::float_to_int(load1 * 100.0 / conv::int_to_float(cores)) end
+
+    let mut sys_seg = ""
+    if cpu_pct > 70 || mem_pct > 80 is
+        sys_seg = "  " + theme.sep + theme.duration_color +
+                  "cpu:" + to_string(cpu_pct) + "% mem:" + to_string(mem_pct) + "%" + rst + "  "
+    end
+
+    ;; ── prompt char ──────────────────────────────────────────────────
+    let mut pc_color = theme.prompt_ok
+    if last_exit_code != 0 is pc_color = theme.prompt_err end
+    let pc = pc_color + theme.prompt_char + rst + " "
+
+    ;; ── assemble ─────────────────────────────────────────────────────
+    let mut out = theme.time_color + time_str + rst + "  "
+    out = out + theme.dir_color + dir + rst
+    out = out + git_seg
+    out = out + sys_seg
+    out = out + depth_seg
+    out = out + root_seg
+    out = out + exit_seg
+    out = out + dur_seg
+    out = out + pc
+    return out
+end
