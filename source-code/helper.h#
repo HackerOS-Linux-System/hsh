@@ -1,0 +1,51 @@
+mod path_cache
+pub fn builtin_names() -> [string] is
+    return ["cd", "pwd", "exit", "export", "unset", "readonly", "declare",
+            "typeset", "local", "alias", "unalias", "set", "history",
+            "which", "type", "help", "true", "false", ":", "theme",
+            "read", "eval", "pushd", "popd", "dirs", "jobs", "fg", "bg",
+            "stop", "kill", "wait", "hsh-audit", "hsh-version",
+            "source", "."]
+end
+
+;; The full word list `hp::completer_from_words` should be seeded
+;; with: builtins + alias names + cached PATH commands, deduplicated.
+pub fn build_completion_words(aliases: any, pc: path_cache::PathCache) -> [string] is
+    let mut seen = hashmap_new()
+    let mut out: [string] = []
+
+    let mut i = 0
+    let builtins = builtin_names()
+    while i < builtins.len() is
+        let cur = i
+        i = i + 1
+        if !seen.contains_key(builtins[cur]) is
+            seen.insert(builtins[cur], "1")
+            out.push(builtins[cur])
+        end
+    end
+
+    let akeys = aliases.keys()
+    let mut j = 0
+    while j < akeys.len() is
+        let cur = j
+        j = j + 1
+        let k = to_string(akeys[cur])
+        if !seen.contains_key(k) is
+            seen.insert(k, "1")
+            out.push(k)
+        end
+    end
+
+    let mut m = 0
+    while m < pc.commands.len() is
+        let cur = m
+        m = m + 1
+        if !seen.contains_key(pc.commands[cur]) is
+            seen.insert(pc.commands[cur], "1")
+            out.push(pc.commands[cur])
+        end
+    end
+
+    return out
+end
