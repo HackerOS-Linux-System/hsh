@@ -1,0 +1,195 @@
+use "std -> fs"        from "fs"
+mod util
+mod vars
+struct HshConfig is
+    pub history_limit: int
+    pub default_theme: string
+    pub errexit: bool
+    pub xtrace: bool
+    pub nounset: bool
+    pub show_duration: bool
+    pub show_exit_code: bool
+    pub show_hidden: bool
+    pub max_completions: int
+    pub confirm_dangerous: bool
+    pub deny_commands: [string]
+    pub auto_chmod: bool
+end
+
+pub fn config_default() -> HshConfig is
+    return HshConfig {
+        history_limit: 10000, default_theme: "hacker",
+        errexit: false, xtrace: false, nounset: false,
+        show_duration: true, show_exit_code: true,
+        show_hidden: false, max_completions: 20,
+        confirm_dangerous: true, deny_commands: [], auto_chmod: true,
+    }
+end
+
+struct ConfigResult is
+    pub v: any            ;; vars::ShellVars
+    pub aliases: any       ;; hashmap
+    pub cfg: HshConfig
+end
+
+fn apply_bool_key(mut cfg: HshConfig, key: string, value: string) -> HshConfig is
+    let on = value == "true"
+    if key == "errexit" is cfg.errexit = on end
+    if key == "xtrace" is cfg.xtrace = on end
+    if key == "nounset" is cfg.nounset = on end
+    if key == "show_duration" is cfg.show_duration = on end
+    if key == "show_exit_code" is cfg.show_exit_code = on end
+    if key == "show_hidden" is cfg.show_hidden = on end
+    if key == "confirm_dangerous" is cfg.confirm_dangerous = on end
+    if key == "auto_chmod" is cfg.auto_chmod = on end
+    return cfg
+end
+
+fn apply_shell_key(mut cfg: HshConfig, key: string, value: string) -> HshConfig is
+    if key == "history_limit" is
+        if util::is_all_digits(value) is cfg.history_limit = value.parse_int() end
+    end
+    if key == "default_theme" is cfg.default_theme = value end
+    cfg = apply_bool_key(cfg, key, value)
+    return cfg
+end
+
+fn apply_prompt_key(mut cfg: HshConfig, key: string, value: string) -> HshConfig is
+    cfg = apply_bool_key(cfg, key, value)
+    return cfg
+end
+
+fn apply_completion_key(mut cfg: HshConfig, key: string, value: string) -> HshConfig is
+    if key == "max_completions" is
+        if util::is_all_digits(value) is cfg.max_completions = value.parse_int() end
+    end
+    cfg = apply_bool_key(cfg, key, value)
+    return cfg
+end
+
+fn apply_safety_key(mut cfg: HshConfig, key: string, value: string) -> HshConfig is
+    if key == "deny_commands" is
+        cfg.deny_commands = value.split(",")
+    end
+    cfg = apply_bool_key(cfg, key, value)
+    return cfg
+end
+
+fn apply_scripts_key(mut cfg: HshConfig, key: string, value: string) -> HshConfig is
+    cfg = apply_bool_key(cfg, key, value)
+    return cfg
+end
+
+pub fn load_hshrc(mut v: any, mut aliases: any, path: string) -> ConfigResult is
+    let mut cfg = config_default()
+    if !fs::exists(path) is
+        return ConfigResult { v: v, aliases: aliases, cfg: cfg }
+    end
+    let lines = fs::read_lines(path)
+    let mut section = ""
+    let mut i = 0
+    while i < lines.len() is
+        let cur = i
+        i = i + 1
+        let line = lines[cur].trim()
+        let mut skip = false
+        if line == "" is skip = true end
+        if !skip is
+            if line.starts_with("#") is skip = true end
+        end
+        if !skip is
+            if line.starts_with(";;") is skip = true end
+        end
+        if !skip is
+            if line.starts_with("[") is
+                if line.ends_with("]") is
+                    section = line[1..line.len() - 1].trim()
+                    skip = true
+                end
+            end
+        end
+        if !skip is
+            let eq = line.index_of("=")
+            if eq >= 0 is
+                let key = line[0..eq].trim()
+                let value = util::strip_quotes(line[eq + 1..line.len()])
+                if section == "env" is
+                    v = vars::vars_export(v, key, value)
+                end
+                if section == "aliases" is
+                    aliases = vars::alias_set(aliases, key, value)
+                end
+                if section == "shell" is cfg = apply_shell_key(cfg, key, value) end
+                if section == "prompt" is cfg = apply_prompt_key(cfg, key, value) end
+                if section == "completion" is cfg = apply_completion_key(cfg, key, value) end
+                if section == "safety" is cfg = apply_safety_key(cfg, key, value) end
+                if section == "scripts" is cfg = apply_scripts_key(cfg, key, value) end
+            end
+        end
+    end
+    return ConfigResult { v: v, aliases: aliases, cfg: cfg }
+end
+
+;; Same default content (sections/keys/comments) as the original's
+;; `DEFAULT_HSHRC`, minus the hint/path-cache JSON file settings
+;; (those belong to `smarthints.h#`/`path_cache.h#`, which persist
+;; their own state directly rather than reading it back out of the
+;; config file, so there's nothing here for those keys to configure).
+pub fn default_hshrc_text() -> string is
+    let mut s = ""
+    s = s + "# ─────────────────────────────────────────────────────────\n"
+    s = s + "# ~/.hshrc — hsh (H# port) config\n"
+    s = s + "# ─────────────────────────────────────────────────────────\n\n"
+    s = s + "[shell]\n"
+    s = s + "default_theme  = \"hacker\"\n"
+    s = s + "history_limit  = 10000\n"
+    s = s + "errexit        = false\n"
+    s = s + "xtrace         = false\n"
+    s = s + "nounset        = false\n\n"
+    s = s + "[prompt]\n"
+    s = s + "show_duration  = true\n"
+    s = s + "show_exit_code = true\n\n"
+    s = s + "[aliases]\n"
+    s = s + "ll    = \"ls -la\"\n"
+    s = s + "la    = \"ls -a\"\n"
+    s = s + "l     = \"ls -l\"\n"
+    s = s + "grep  = \"grep --color=auto\"\n"
+    s = s + "diff  = \"diff --color=auto\"\n"
+    s = s + "mkdir = \"mkdir -p\"\n"
+    s = s + "gs    = \"git status\"\n"
+    s = s + "ga    = \"git add\"\n"
+    s = s + "gc    = \"git commit -m\"\n"
+    s = s + "gp    = \"git push\"\n"
+    s = s + "gl    = \"git log --oneline --graph --decorate\"\n"
+    s = s + "gd    = \"git diff\"\n"
+    s = s + "gco   = \"git checkout\"\n"
+    s = s + "gb    = \"git branch\"\n"
+    s = s + "cb    = \"cargo build\"\n"
+    s = s + "cr    = \"cargo run\"\n"
+    s = s + "ct    = \"cargo test\"\n"
+    s = s + "cc    = \"cargo check\"\n"
+    s = s + "cls   = \"clear\"\n"
+    s = s + "q     = \"exit\"\n"
+    s = s + "h     = \"history\"\n"
+    s = s + "j     = \"jobs\"\n\n"
+    s = s + "[env]\n"
+    s = s + "# EDITOR = \"nano\"\n"
+    s = s + "# VISUAL = \"nano\"\n"
+    s = s + "# PAGER  = \"less\"\n\n"
+    s = s + "[completion]\n"
+    s = s + "show_hidden     = false\n"
+    s = s + "max_completions = 20\n\n"
+    s = s + "[safety]\n"
+    s = s + "confirm_dangerous = true\n"
+    s = s + "# deny_commands = \"nc, telnet, ncat\"\n\n"
+    s = s + "[scripts]\n"
+    s = s + "auto_chmod = true\n"
+    return s
+end
+
+;; Self-contained (no struct param) for the same reason as
+;; `hsh_util::write_raw` — see README.md's porting notes.
+pub fn ensure_hshrc_exists(path: string) is
+    if fs::exists(path) is return end
+    fs::write(path, default_hshrc_text())
+end
