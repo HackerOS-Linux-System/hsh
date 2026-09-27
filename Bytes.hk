@@ -6,7 +6,7 @@
 
 [build]
 -> lang   => h#
--> entry  => src/main.h#
+-> entry  => source-code/main.h#
 -> output => build/hsh
 -> emit   => bin
 
