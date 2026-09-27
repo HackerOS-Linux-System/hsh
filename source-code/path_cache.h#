@@ -1,0 +1,171 @@
+use "std -> fs"        from "fs"
+use "std -> hash"      from "hash"
+use "std -> process"   from "proc"
+mod util
+fn cache_ttl_secs() -> int is return 300 end
+
+struct PathCache is
+    pub commands: [string]
+    pub cache_file: string
+    pub path_hash: int
+end
+
+fn compute_path_hash(path_var: string) -> int is
+    return hash::djb2(path_var)
+end
+
+fn now_secs() -> int is
+    return __builtin_time_now_unix()
+end
+
+fn find_executables_in(dir: string) -> [string] is
+    if !fs::is_dir(dir) is return [] end
+    let out = run_find_executables(dir)
+    if out.trim() == "" is return [] end
+    let lines = out.split("\n")
+    let mut names: [string] = []
+    let mut i = 0
+    while i < lines.len() is
+        let cur = i
+        i = i + 1
+        let line = lines[cur].trim()
+        if line != "" is
+            ;; `find` prints the full path; keep the basename only
+            let parts = line.split("/")
+            names.push(parts[parts.len() - 1])
+        end
+    end
+    return names
+end
+
+fn run_find_executables(dir: string) -> string is
+    return proc::run("find '" + dir + "' -maxdepth 1 -type f -perm -u+x 2>/dev/null")
+end
+
+fn dedup_sorted(names: [string]) -> [string] is
+    let mut seen = hashmap_new()
+    let mut out: [string] = []
+    let mut i = 0
+    while i < names.len() is
+        let cur = i
+        i = i + 1
+        if !seen.contains_key(names[cur]) is
+            seen.insert(names[cur], "1")
+            out.push(names[cur])
+        end
+    end
+    return __builtin_sort_strings(out)
+end
+
+fn build_commands(path_var: string) -> [string] is
+    let dirs = path_var.split(":")
+    let mut all: [string] = []
+    let mut i = 0
+    while i < dirs.len() is
+        let cur = i
+        i = i + 1
+        if dirs[cur] != "" is
+            let found = find_executables_in(dirs[cur])
+            let mut j = 0
+            while j < found.len() is
+                let cj = j
+                j = j + 1
+                all.push(found[cj])
+            end
+        end
+    end
+    return dedup_sorted(all)
+end
+
+;; Cache file line format: "built_at\tpath_hash\tcmd1,cmd2,..."
+fn parse_cache_line(line: string) -> (int, int, [string]) is
+    let parts = line.split("\t")
+    if parts.len() < 3 is return (0, 0, []) end
+    let mut built_at = 0
+    let mut path_hash = 0
+    if util::is_all_digits(parts[0]) is built_at = parts[0].parse_int() end
+    if util::is_all_digits(parts[1]) is path_hash = parts[1].parse_int() end
+    let mut cmds: [string] = []
+    if parts[2] != "" is cmds = parts[2].split(",") end
+    return (built_at, path_hash, cmds)
+end
+
+fn save_cache(cache_file: string, commands: [string], path_hash: int) is
+    let line = to_string(now_secs()) + "\t" + to_string(path_hash) + "\t" + commands.join(",")
+    fs::write(cache_file, line)
+end
+
+pub fn path_cache_new(cache_file: string, path_var: string) -> PathCache is
+    let ph = compute_path_hash(path_var)
+    let cached = try_load_cache(cache_file, ph)
+    if cached.len() > 0 is
+        return PathCache { commands: cached, cache_file: cache_file, path_hash: ph }
+    end
+    let built = build_commands(path_var)
+    save_cache(cache_file, built, ph)
+    return PathCache { commands: built, cache_file: cache_file, path_hash: ph }
+end
+
+;; Returns the cached command list if the on-disk cache exists, is
+;; fresh (younger than `cache_ttl_secs()`), and matches the current
+;; PATH hash — otherwise an empty array (never `nil`; kept scalar/
+;; array-only and free of any struct-return-after-`if` shape on
+;; purpose, see README.md's porting notes).
+fn try_load_cache(cache_file: string, ph: int) -> [string] is
+    if !fs::exists(cache_file) is return [] end
+    let lines = fs::read_lines(cache_file)
+    if lines.len() == 0 is return [] end
+    let (built_at, cached_hash, cmds) = parse_cache_line(lines[0])
+    let age = now_secs() - built_at
+    if age < 0 is return [] end
+    if age >= cache_ttl_secs() is return [] end
+    if cached_hash != ph is return [] end
+    return cmds
+end
+
+;; Rebuilds (and re-saves) if PATH has changed since this cache was
+;; built. Returns the (possibly unchanged) cache — reassign at the
+;; call site, same discipline as everywhere else in this project.
+pub fn path_cache_refresh_if_stale(mut pc: PathCache, path_var: string) -> PathCache is
+    let current_hash = compute_path_hash(path_var)
+    if current_hash == pc.path_hash is return pc end
+    pc.path_hash = current_hash
+    pc.commands = build_commands(path_var)
+    save_cache(pc.cache_file, pc.commands, pc.path_hash)
+    return pc
+end
+
+pub fn path_cache_contains(pc: PathCache, cmd: string) -> bool is
+    let mut i = 0
+    let mut found = false
+    while i < pc.commands.len() is
+        let cur = i
+        i = i + 1
+        if pc.commands[cur] == cmd is found = true end
+    end
+    return found
+end
+
+;; First cached command name starting with `prefix`, or "".
+pub fn path_cache_find_prefix(pc: PathCache, prefix: string) -> string is
+    let mut i = 0
+    let mut found = ""
+    while i < pc.commands.len() && found == "" is
+        let cur = i
+        i = i + 1
+        if pc.commands[cur].starts_with(prefix) is found = pc.commands[cur] end
+    end
+    return found
+end
+
+;; Every cached command starting with `prefix` (for tab-completion).
+pub fn path_cache_all_prefix(pc: PathCache, prefix: string) -> [string] is
+    let mut out: [string] = []
+    let mut i = 0
+    while i < pc.commands.len() is
+        let cur = i
+        i = i + 1
+        if pc.commands[cur].starts_with(prefix) is out.push(pc.commands[cur]) end
+    end
+    return out
+end
