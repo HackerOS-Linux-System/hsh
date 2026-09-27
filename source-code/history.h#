@@ -1,0 +1,227 @@
+use "std -> fs"           from "fs"
+mod util
+mod security
+struct HistoryEntry is
+    pub command: string
+    pub timestamp: int    ;; unix seconds
+end
+
+struct ShellHistory is
+    pub entries: [HistoryEntry]
+    pub path: string
+    pub dirty: bool
+end
+
+fn resolve_history_path(path: string, home: string) -> string is
+    if !path.contains("/") is
+        if home == "" is return "/root/" + path end
+        return home + "/" + path
+    end
+    if path.starts_with("~") is
+        return home + path[1..path.len()]
+    end
+    return path
+end
+
+fn parse_entry_line(line: string) -> HistoryEntry is
+    let tab = line.index_of("\t")
+    if tab < 0 is return HistoryEntry { command: line, timestamp: 0 } end
+    let ts_str = line[0..tab]
+    let mut ts = 0
+    if util::is_all_digits(ts_str) is ts = ts_str.parse_int() end
+    return HistoryEntry { command: line[tab + 1..line.len()], timestamp: ts }
+end
+
+pub fn rich_history_load(path: string, home: string) -> ShellHistory is
+    let canonical = resolve_history_path(path, home)
+    if !fs::exists(canonical) is
+        return ShellHistory { entries: [], path: canonical, dirty: false }
+    end
+    let lines = fs::read_lines(canonical)
+    let mut entries: [HistoryEntry] = []
+    let mut i = 0
+    while i < lines.len() is
+        let cur = i
+        i = i + 1
+        if lines[cur].trim() != "" is
+            entries.push(parse_entry_line(lines[cur]))
+        end
+    end
+    return ShellHistory { entries: entries, path: canonical, dirty: false }
+end
+
+fn entry_to_line(e: HistoryEntry) -> string is
+    return to_string(e.timestamp) + "\t" + e.command
+end
+
+pub fn rich_history_save(mut h: ShellHistory) -> ShellHistory is
+    let mut lines: [string] = []
+    let mut i = 0
+    while i < h.entries.len() is
+        let cur = i
+        i = i + 1
+        lines.push(entry_to_line(h.entries[cur]))
+    end
+    fs::write(h.path, lines.join("\n") + "\n")
+    h.dirty = false
+    return h
+end
+
+;; Adds an entry — skipped if blank or identical to the last entry
+;; (matching hprompt's/the original's own dedup convention). Secrets
+;; are redacted before the command is stored. Auto-saves every 10
+;; entries, same as the original.
+pub fn rich_history_add(mut h: ShellHistory, cmd: string, now_ts: int) -> ShellHistory is
+    let trimmed = cmd.trim()
+    if trimmed == "" is return h end
+    let redacted = security::redact_secrets(trimmed)
+
+    let mut is_dup = false
+    if h.entries.len() > 0 is
+        if h.entries[h.entries.len() - 1].command == redacted is is_dup = true end
+    end
+    if is_dup is return h end
+
+    h.entries.push(HistoryEntry { command: redacted, timestamp: now_ts })
+    h.dirty = true
+    if h.entries.len() % 10 == 0 is
+        h = rich_history_save(h)
+    end
+    return h
+end
+
+pub fn rich_history_last_command(h: ShellHistory) -> string is
+    if h.entries.len() == 0 is return "" end
+    return h.entries[h.entries.len() - 1].command
+end
+
+pub fn rich_history_len(h: ShellHistory) -> int is
+    return h.entries.len()
+end
+
+;; Prints every entry (most recent last — matching a normal shell's
+;; `history`), capped at the most recent 1000, numbered, timestamped,
+;; colored like the original.
+pub fn rich_history_print_all(h: ShellHistory) is
+    let mut start = 0
+    if h.entries.len() > 1000 is start = h.entries.len() - 1000 end
+    let mut i = start
+    while i < h.entries.len() is
+        let cur = i
+        i = i + 1
+        let e = h.entries[cur]
+        let ts_str = __builtin_date_format(e.timestamp, "%Y-%m-%d %H:%M:%S")
+        write("\x1b[38;5;242m" + pad_left(to_string(cur + 1), 5) + "\x1b[0m  " +
+              "\x1b[38;5;238m" + ts_str + "\x1b[0m  " + e.command)
+    end
+end
+
+fn pad_left(s: string, width: int) -> string is
+    let mut out = s
+    while out.len() < width is
+        out = " " + out
+    end
+    return out
+end
+
+;; Subsequence-based fuzzy score: -1 if `query`'s characters don't all
+;; appear in `candidate` in order; otherwise a positive score that's
+;; higher for a tighter match span and for matches starting earlier.
+fn fuzzy_score(candidate: string, query: string) -> int is
+    if query == "" is return 0 end
+    let cl = candidate.to_lower()
+    let ql = query.to_lower()
+    let mut qi = 0
+    let mut ci = 0
+    let mut first_match = -1
+    let mut last_match = -1
+    while ci < cl.len() && qi < ql.len() is
+        let cur_c = ci
+        ci = ci + 1
+        if cl[cur_c..cur_c + 1] == ql[qi..qi + 1] is
+            if first_match < 0 is first_match = cur_c end
+            last_match = cur_c
+            qi = qi + 1
+        end
+    end
+    if qi < ql.len() is return -1 end
+    let span = last_match - first_match + 1
+    ;; shorter span and earlier start both score higher
+    return 1000 - span - (first_match / 4)
+end
+
+struct FuzzyHit is
+    pub command: string
+    pub timestamp: int
+    pub score: int
+end
+
+;; Most-recent-first source order, then stably re-ordered best-score-
+;; first, deduplicated by command text (first/best occurrence wins).
+pub fn rich_history_fuzzy_search(h: ShellHistory, query: string) -> [FuzzyHit] is
+    let mut seen = hashmap_new()
+    let mut hits: [FuzzyHit] = []
+    let mut i = h.entries.len() - 1
+    while i >= 0 is
+        let cur = i
+        i = i - 1
+        let e = h.entries[cur]
+        if !seen.contains_key(e.command) is
+            let score = fuzzy_score(e.command, query)
+            if score >= 0 is
+                seen.insert(e.command, "1")
+                hits.push(FuzzyHit { command: e.command, timestamp: e.timestamp, score: score })
+            end
+        end
+    end
+    return sort_hits_by_score(hits)
+end
+
+;; Simple insertion sort (descending by score) — the lists this runs
+;; over are history-sized (hundreds, not millions), so O(n^2) is fine
+;; and it avoids needing a working generic/comparator sort (`std ->
+;; sort`'s own shipped file doesn't even parse on this interpreter —
+;; see README.md's porting notes).
+fn sort_hits_by_score(hits: [FuzzyHit]) -> [FuzzyHit] is
+    let mut arr = hits
+    let mut i = 1
+    while i < arr.len() is
+        let cur_i = i
+        i = i + 1
+        let key = arr[cur_i]
+        let mut j = cur_i - 1
+        let mut going = true
+        while going is
+            if j < 0 is
+                going = false
+            else is
+                if arr[j].score < key.score is
+                    arr[j + 1] = arr[j]
+                    j = j - 1
+                else is
+                    going = false
+                end
+            end
+        end
+        arr[j + 1] = key
+    end
+    return arr
+end
+
+;; Most recent `n` unique commands, newest first (for hint/suggestion
+;; use in smarthints.h#).
+pub fn rich_history_recent_unique(h: ShellHistory, n: int) -> [string] is
+    let mut seen = hashmap_new()
+    let mut out: [string] = []
+    let mut i = h.entries.len() - 1
+    while i >= 0 && out.len() < n is
+        let cur = i
+        i = i - 1
+        let cmd = h.entries[cur].command
+        if !seen.contains_key(cmd) is
+            seen.insert(cmd, "1")
+            out.push(cmd)
+        end
+    end
+    return out
+end
