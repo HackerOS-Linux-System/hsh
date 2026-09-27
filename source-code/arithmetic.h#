@@ -1,0 +1,409 @@
+mod util
+;; ── $(( )) arithmetic — port of the original's arithmetic.rs ───────────
+;; Tokens are tagged structs (kind + payload), same reasoning as
+;; hprompt's `ReadResult`: no cross-module concern here since this is
+;; all one file, but kept consistent, and it also just reads clearly.
+
+struct Tok is
+    pub kind: string   ;; "num" | "+" | "-" | "*" | "/" | "%" | "**" |
+                        ;; "(" | ")" | "==" | "!=" | "<" | "<=" | ">" |
+                        ;; ">=" | "&&" | "||" | "!"
+    pub num: int        ;; valid when kind == "num"
+end
+
+fn ar_var_int(vars: any, name: string) -> int is
+    if !vars.contains_key(name) is return 0 end
+    let raw = vars.get(name).trim()
+    if util::is_all_digits(raw) is return raw.parse_int() end
+    if raw.starts_with("-") is
+        if util::is_all_digits(raw[1..raw.len()]) is return 0 - raw[1..raw.len()].parse_int() end
+    end
+    return 0
+end
+
+fn ar_scan_number(s: string, start: int, n: int) -> (Tok, int) is
+    let mut j = start
+    let mut going = true
+    while going is
+        if j >= n is
+            going = false
+        else is
+            if util::is_digit(s[j..j + 1]) is
+                j = j + 1
+            else is
+                going = false
+            end
+        end
+    end
+    return (Tok { kind: "num", num: s[start..j].parse_int() }, j)
+end
+
+
+
+;; Returns (token, index_after_token).
+fn ar_next_token(s: string, start: int, n: int, vars: any) -> (Tok, int) is
+    let c = s[start..start + 1]
+
+    if util::is_digit(c) is return ar_scan_number(s, start, n) end
+
+    if util::is_alpha(c) is
+        let j = util::scan_ident_end(s, start, n)
+        return (Tok { kind: "num", num: ar_var_int(vars, s[start..j]) }, j)
+    end
+
+    if c == "$" is
+        let mut is_brace = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "{" is is_brace = true end
+        end
+        if is_brace is
+            let j = util::find_matching_brace(s, start + 1, n)
+            let name = s[start + 2..j]
+            let after = if j < n is j + 1 else j end
+            return (Tok { kind: "num", num: ar_var_int(vars, name) }, after)
+        end
+        let j = util::scan_ident_end(s, start + 1, n)
+        return (Tok { kind: "num", num: ar_var_int(vars, s[start + 1..j]) }, j)
+    end
+
+    if c == "+" is return (Tok { kind: "+", num: 0 }, start + 1) end
+    if c == "-" is return (Tok { kind: "-", num: 0 }, start + 1) end
+    if c == "%" is return (Tok { kind: "%", num: 0 }, start + 1) end
+    if c == "(" is return (Tok { kind: "(", num: 0 }, start + 1) end
+    if c == ")" is return (Tok { kind: ")", num: 0 }, start + 1) end
+
+    if c == "*" is
+        let mut is_pow = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "*" is is_pow = true end
+        end
+        if is_pow is return (Tok { kind: "**", num: 0 }, start + 2) end
+        return (Tok { kind: "*", num: 0 }, start + 1)
+    end
+
+    if c == "/" is return (Tok { kind: "/", num: 0 }, start + 1) end
+
+    if c == "=" is
+        let mut is_eq = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "=" is is_eq = true end
+        end
+        if is_eq is return (Tok { kind: "==", num: 0 }, start + 2) end
+        return (Tok { kind: "==", num: 0 }, start + 1)
+    end
+
+    if c == "!" is
+        let mut is_ne = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "=" is is_ne = true end
+        end
+        if is_ne is return (Tok { kind: "!=", num: 0 }, start + 2) end
+        return (Tok { kind: "!", num: 0 }, start + 1)
+    end
+
+    if c == "<" is
+        let mut is_le = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "=" is is_le = true end
+        end
+        if is_le is return (Tok { kind: "<=", num: 0 }, start + 2) end
+        return (Tok { kind: "<", num: 0 }, start + 1)
+    end
+
+    if c == ">" is
+        let mut is_ge = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "=" is is_ge = true end
+        end
+        if is_ge is return (Tok { kind: ">=", num: 0 }, start + 2) end
+        return (Tok { kind: ">", num: 0 }, start + 1)
+    end
+
+    if c == "&" is
+        let mut is_and = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "&" is is_and = true end
+        end
+        if is_and is return (Tok { kind: "&&", num: 0 }, start + 2) end
+        return (Tok { kind: "&&", num: 0 }, start + 1)
+    end
+
+    if c == "|" is
+        let mut is_or = false
+        if start + 1 < n is
+            if s[start + 1..start + 2] == "|" is is_or = true end
+        end
+        if is_or is return (Tok { kind: "||", num: 0 }, start + 2) end
+        return (Tok { kind: "||", num: 0 }, start + 1)
+    end
+
+    return (Tok { kind: "num", num: 0 }, start + 1)
+end
+
+fn ar_tokenize(expr: string, vars: any) -> [Tok] is
+    let mut tokens: [Tok] = []
+    let s = expr.trim()
+    let n = s.len()
+    let mut i = 0
+    while i < n is
+        let c = s[i..i + 1]
+        ;; BUG FIX: was bare `is_ws(c)`. `is_ws` is defined in `util.h#`
+        ;; (this file has `mod util` at the top and correctly calls
+        ;; every *other* util function qualified — `util::is_digit`,
+        ;; `util::is_alpha`, `util::scan_ident_end`, etc. — just above
+        ;; and below this function) but this one call was left
+        ;; unqualified. Once `mod util` is inlined, `is_ws` only exists
+        ;; as `util_is_ws`; a bare reference to it has nothing to
+        ;; resolve to, hence `codegen: undefined fn: is_ws`.
+        if util::is_ws(c) is
+            i = i + 1
+        else is
+            let (tok, next_i) = ar_next_token(s, i, n, vars)
+            tokens.push(tok)
+            i = next_i
+        end
+    end
+    return tokens
+end
+
+fn ar_peek(tokens: [Tok], pos: int) -> string is
+    if pos < 0 is return "" end
+    if pos >= tokens.len() is return "" end
+    return tokens[pos].kind
+end
+
+fn ar_ipow(base: int, exp: int) -> int is
+    if exp <= 0 is return 1 end
+    let mut result = 1
+    let mut i = 0
+    while i < exp is
+        result = result * base
+        i = i + 1
+    end
+    return result
+end
+
+fn ar_parse_primary(tokens: [Tok], pos: int) -> (int, int) is
+    let k = ar_peek(tokens, pos)
+    if k == "num" is return (tokens[pos].num, pos + 1) end
+    if k == "(" is
+        let (v, p) = ar_parse_or(tokens, pos + 1)
+        if ar_peek(tokens, p) == ")" is return (v, p + 1) end
+        return (v, p)
+    end
+    return (0, pos + 1)
+end
+
+fn ar_parse_unary(tokens: [Tok], pos: int) -> (int, int) is
+    let k = ar_peek(tokens, pos)
+    if k == "-" is
+        let (v, p) = ar_parse_primary(tokens, pos + 1)
+        return (0 - v, p)
+    end
+    if k == "!" is
+        let (v, p) = ar_parse_primary(tokens, pos + 1)
+        return ((if v == 0 is 1 else 0 end), p)
+    end
+    return ar_parse_primary(tokens, pos)
+end
+
+fn ar_parse_pow(tokens: [Tok], pos: int) -> (int, int) is
+    let (base, p) = ar_parse_unary(tokens, pos)
+    if ar_peek(tokens, p) == "**" is
+        let (exp, p2) = ar_parse_unary(tokens, p + 1)
+        return (ar_ipow(base, exp), p2)
+    end
+    return (base, p)
+end
+
+fn ar_parse_mul(tokens: [Tok], pos: int) -> (int, int) is
+    let (left0, p0) = ar_parse_pow(tokens, pos)
+    let mut left = left0
+    let mut p = p0
+    let mut going = true
+    while going is
+        let k = ar_peek(tokens, p)
+        if k == "*" is
+            let (right, p2) = ar_parse_pow(tokens, p + 1)
+            left = left * right
+            p = p2
+        else is
+            if k == "/" is
+                let (right, p2) = ar_parse_pow(tokens, p + 1)
+                if right == 0 is left = 0 else left = left / right end
+                p = p2
+            else is
+                if k == "%" is
+                    let (right, p2) = ar_parse_pow(tokens, p + 1)
+                    if right == 0 is left = 0 else left = left % right end
+                    p = p2
+                else is
+                    going = false
+                end
+            end
+        end
+    end
+    return (left, p)
+end
+
+fn ar_parse_add(tokens: [Tok], pos: int) -> (int, int) is
+    let (left0, p0) = ar_parse_mul(tokens, pos)
+    let mut left = left0
+    let mut p = p0
+    let mut going = true
+    while going is
+        let k = ar_peek(tokens, p)
+        if k == "+" is
+            let (right, p2) = ar_parse_mul(tokens, p + 1)
+            left = left + right
+            p = p2
+        else is
+            if k == "-" is
+                let (right, p2) = ar_parse_mul(tokens, p + 1)
+                left = left - right
+                p = p2
+            else is
+                going = false
+            end
+        end
+    end
+    return (left, p)
+end
+
+fn ar_parse_cmp(tokens: [Tok], pos: int) -> (int, int) is
+    let (left0, p0) = ar_parse_add(tokens, pos)
+    let mut left = left0
+    let mut p = p0
+    let mut going = true
+    while going is
+        let k = ar_peek(tokens, p)
+        if k == "==" is
+            let (right, p2) = ar_parse_add(tokens, p + 1)
+            left = (if left == right is 1 else 0 end)
+            p = p2
+        else is
+            if k == "!=" is
+                let (right, p2) = ar_parse_add(tokens, p + 1)
+                left = (if left != right is 1 else 0 end)
+                p = p2
+            else is
+                if k == "<=" is
+                    let (right, p2) = ar_parse_add(tokens, p + 1)
+                    left = (if left <= right is 1 else 0 end)
+                    p = p2
+                else is
+                    if k == "<" is
+                        let (right, p2) = ar_parse_add(tokens, p + 1)
+                        left = (if left < right is 1 else 0 end)
+                        p = p2
+                    else is
+                        if k == ">=" is
+                            let (right, p2) = ar_parse_add(tokens, p + 1)
+                            left = (if left >= right is 1 else 0 end)
+                            p = p2
+                        else is
+                            if k == ">" is
+                                let (right, p2) = ar_parse_add(tokens, p + 1)
+                                left = (if left > right is 1 else 0 end)
+                                p = p2
+                            else is
+                                going = false
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return (left, p)
+end
+
+fn ar_parse_and(tokens: [Tok], pos: int) -> (int, int) is
+    let (left0, p0) = ar_parse_cmp(tokens, pos)
+    let mut left = left0
+    let mut p = p0
+    let mut going = true
+    while going is
+        if ar_peek(tokens, p) == "&&" is
+            let (right, p2) = ar_parse_cmp(tokens, p + 1)
+            left = (if left != 0 && right != 0 is 1 else 0 end)
+            p = p2
+        else is
+            going = false
+        end
+    end
+    return (left, p)
+end
+
+fn ar_parse_or(tokens: [Tok], pos: int) -> (int, int) is
+    let (left0, p0) = ar_parse_and(tokens, pos)
+    let mut left = left0
+    let mut p = p0
+    let mut going = true
+    while going is
+        if ar_peek(tokens, p) == "||" is
+            let (right, p2) = ar_parse_and(tokens, p + 1)
+            left = (if left != 0 || right != 0 is 1 else 0 end)
+            p = p2
+        else is
+            going = false
+        end
+    end
+    return (left, p)
+end
+
+fn ar_evaluate(expr: string, vars: any) -> int is
+    let tokens = ar_tokenize(expr, vars)
+    let (v, _p) = ar_parse_or(tokens, 0)
+    return v
+end
+
+;; Expand every `$(( expr ))` in `input`.
+fn ar_expand(input: string, vars: any) -> string is
+    let mut result = ""
+    let n = input.len()
+    let mut i = 0
+    while i < n is
+        let mut matched = false
+        if i + 2 < n is
+            if input[i..i + 1] == "$" is
+                if input[i + 1..i + 2] == "(" is
+                    if input[i + 2..i + 3] == "(" is matched = true end
+                end
+            end
+        end
+        if matched is
+            let start = i + 3
+            let mut depth = 2
+            let mut j = start
+            let mut going = true
+            while going is
+                if j >= n is
+                    going = false
+                else is
+                    let cj = input[j..j + 1]
+                    if cj == "(" is depth = depth + 1 end
+                    if cj == ")" is
+                        depth = depth - 1
+                        if depth == 0 is going = false end
+                    end
+                    if going is j = j + 1 end
+                end
+            end
+            let expr = input[start..j]
+            let mut after = j
+            if after < n is
+                if input[after..after + 1] == ")" is after = after + 1 end
+            end
+            if after < n is
+                if input[after..after + 1] == ")" is after = after + 1 end
+            end
+            result = result + to_string(ar_evaluate(expr, vars))
+            i = after
+        else is
+            result = result + input[i..i + 1]
+            i = i + 1
+        end
+    end
+    return result
+end
