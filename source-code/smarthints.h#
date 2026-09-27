@@ -1,0 +1,126 @@
+mod util
+mod path_cache
+mod history
+;; Classic dynamic-programming edit distance.
+pub fn levenshtein(a: string, b: string) -> int is
+    let la = a.len()
+    let lb = b.len()
+    if la == 0 is return lb end
+    if lb == 0 is return la end
+
+    let mut prev: [int] = []
+    let mut i = 0
+    while i <= lb is
+        let cur = i
+        i = i + 1
+        prev.push(cur)
+    end
+
+    let mut ai = 0
+    while ai < la is
+        let cur_ai = ai
+        ai = ai + 1
+        let mut curr: [int] = [cur_ai + 1]
+        let ca = a[cur_ai..cur_ai + 1]
+        let mut bi = 0
+        while bi < lb is
+            let cur_bi = bi
+            bi = bi + 1
+            let cb = b[cur_bi..cur_bi + 1]
+            let mut cost = 1
+            if ca == cb is cost = 0 end
+            let del_cost = prev[cur_bi + 1] + 1
+            let ins_cost = curr[cur_bi] + 1
+            let sub_cost = prev[cur_bi] + cost
+            let mut best = del_cost
+            if ins_cost < best is best = ins_cost end
+            if sub_cost < best is best = sub_cost end
+            curr.push(best)
+        end
+        prev = curr
+    end
+    return prev[lb]
+end
+
+;; Best "did you mean X?" suggestion for `typo` among the cached PATH
+;; commands + a fixed list of builtin names, or "" if nothing is
+;; close enough (distance > 2, or the typo is very short).
+pub fn suggest_correction(typo: string, pc: path_cache::PathCache, builtins: [string]) -> string is
+    if typo.len() < 2 is return "" end
+    let max_dist = 2
+
+    let mut best = ""
+    let mut best_dist = max_dist + 1
+
+    let mut i = 0
+    while i < builtins.len() is
+        let cur = i
+        i = i + 1
+        let d = levenshtein(typo, builtins[cur])
+        if d < best_dist is
+            best_dist = d
+            best = builtins[cur]
+        end
+    end
+
+    let mut j = 0
+    while j < pc.commands.len() is
+        let cur = j
+        j = j + 1
+        ;; cheap length-based prefilter before the O(n*m) distance calc
+        let len_diff = pc.commands[cur].len() - typo.len()
+        let mut close_enough = len_diff <= max_dist
+        if len_diff < 0 is close_enough = (0 - len_diff) <= max_dist end
+        if close_enough is
+            let d = levenshtein(typo, pc.commands[cur])
+            if d < best_dist is
+                best_dist = d
+                best = pc.commands[cur]
+            end
+        end
+    end
+
+    if best_dist > max_dist is return "" end
+    return best
+end
+
+;; Recognizable project-type signature for the current directory
+;; (used to color a next-command suggestion / could inform future
+;; completion — kept as its own small pure function, same as the
+;; original's `project_signature`).
+pub fn project_signature(has_cargo_toml: bool, has_package_json: bool,
+                          has_pyproject: bool, has_go_mod: bool,
+                          has_bytes_hk: bool, has_git: bool) -> string is
+    if has_bytes_hk is return "h#" end
+    if has_cargo_toml is return "rust" end
+    if has_package_json is return "node" end
+    if has_pyproject is return "python" end
+    if has_go_mod is return "go" end
+    if has_git is return "git" end
+    return ""
+end
+
+;; One "you often run X after Y"-shaped suggestion, based on the two
+;; most recent history entries and a small fixed table of common
+;; follow-ups (a simplified, static stand-in for the original's
+;; frequency-learned model — see the module doc comment).
+pub fn next_command_suggestion(hist: history::ShellHistory) -> string is
+    let last = history::rich_history_last_command(hist)
+    if last == "" is return "" end
+    let first = util::first_word(last)
+
+    if first == "git" is
+        if last.contains("add") is return "git commit" end
+        if last.contains("commit") is return "git push" end
+    end
+    if first == "cd" is return "ls" end
+    if first == "cargo" is
+        if last.contains("build") is return "cargo test" end
+    end
+    if first == "mkdir" is return "cd " + util::rest_after_first_word(last) end
+    if first == "npm" is
+        if last.contains("install") is return "npm run" end
+    end
+
+    return ""
+end
