@@ -1,0 +1,41 @@
+mod theme
+;; Returns the chosen theme name, or "" if the user backed out
+;; (blank/invalid input). `read_line_fn` is the caller's own
+;; line-reading call (typically `hp::editor_readline_with`) — this
+;; module has no dependency on hprompt itself, it just prints the menu
+;; and interprets whatever line the caller already read.
+pub fn settings_render_theme_menu() is
+    write("Wybierz motyw:")
+    let names = theme::theme_names()
+    let mut i = 0
+    while i < names.len() is
+        let cur = i
+        i = i + 1
+        write("  " + to_string(cur + 1) + ") " + names[cur])
+    end
+    write("Wpisz numer (lub puste, aby anulować):")
+end
+
+pub fn settings_parse_theme_choice(input: string) -> string is
+    let trimmed = input.trim()
+    if trimmed == "" is return "" end
+    if !all_digits(trimmed) is return "" end
+    let idx = trimmed.parse_int() - 1
+    let names = theme::theme_names()
+    if idx < 0 is return "" end
+    if idx >= names.len() is return "" end
+    return names[idx]
+end
+
+fn all_digits(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let mut i = 0
+    let mut ok = true
+    while i < s.len() is
+        let cur = i
+        i = i + 1
+        let c = s[cur..cur + 1]
+        if c < "0" || c > "9" is ok = false end
+    end
+    return ok
+end
