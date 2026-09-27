@@ -1,0 +1,133 @@
+use "std -> process" from "proc"
+
+struct Job is
+    pub id: int
+    pub pid: int
+    pub command: string
+    pub status: string    ;; "running" | "stopped" | "done"
+end
+
+struct JobTable is
+    pub jobs: [Job]
+    pub next_id: int
+end
+
+pub fn jobs_new() -> JobTable is
+    return JobTable { jobs: [], next_id: 1 }
+end
+
+;; Registers a new background job and prints the `[id] pid` line real
+;; shells print. Returns the updated table — reassign at the call
+;; site.
+pub fn jobs_add(mut jt: JobTable, pid: int, command: string) -> JobTable is
+    let id = jt.next_id
+    jt.next_id = jt.next_id + 1
+    jt.jobs.push(Job { id: id, pid: pid, command: command, status: "running" })
+    write("[" + to_string(id) + "] " + to_string(pid))
+    return jt
+end
+
+fn job_index_of(jt: JobTable, id: int) -> int is
+    let mut i = 0
+    let mut found = -1
+    while i < jt.jobs.len() is
+        let cur = i
+        i = i + 1
+        if jt.jobs[cur].id == id is found = cur end
+    end
+    return found
+end
+
+pub fn jobs_list(jt: JobTable) is
+    let mut i = 0
+    while i < jt.jobs.len() is
+        let cur = i
+        i = i + 1
+        let j = jt.jobs[cur]
+        write("[" + to_string(j.id) + "] " + pad_status(j.status) + "  " +
+              to_string(j.pid) + "  " + j.command)
+    end
+end
+
+fn pad_status(s: string) -> string is
+    let mut out = s
+    while out.len() < 8 is
+        out = out + " "
+    end
+    return out
+end
+
+pub fn jobs_fg_pid(jt: JobTable, id: int) -> int is
+    let idx = job_index_of(jt, id)
+    if idx < 0 is return -1 end
+    return jt.jobs[idx].pid
+end
+
+pub fn jobs_remove(mut jt: JobTable, id: int) -> JobTable is
+    let idx = job_index_of(jt, id)
+    if idx < 0 is return jt end
+    let mut out: [Job] = []
+    let mut i = 0
+    while i < jt.jobs.len() is
+        let cur = i
+        i = i + 1
+        if cur != idx is out.push(jt.jobs[cur]) end
+    end
+    jt.jobs = out
+    return jt
+end
+
+pub fn jobs_mark_done(mut jt: JobTable, id: int) -> JobTable is
+    let idx = job_index_of(jt, id)
+    if idx < 0 is return jt end
+    jt.jobs[idx].status = "done"
+    return jt
+end
+
+;; Sends `signal_name` (e.g. "TERM", "STOP", "CONT", "KILL", "USR1")
+;; to job `id` via the real `kill` command (see the module doc comment
+;; for why this shells out instead of using `proc::kill`, which is
+;; SIGTERM-only). Returns true if a job with that id was found (not
+;; whether the signal actually succeeded — H#'s `process::run` gives
+;; no exit code to check that with).
+pub fn jobs_send_signal(jt: JobTable, id: int, signal_name: string) -> bool is
+    let idx = job_index_of(jt, id)
+    if idx < 0 is return false end
+    proc::run("kill -" + signal_name + " " + to_string(jt.jobs[idx].pid))
+    return true
+end
+
+pub fn jobs_bg(jt: JobTable, id: int) -> bool is
+    return jobs_send_signal(jt, id, "CONT")
+end
+
+pub fn jobs_stop(jt: JobTable, id: int) -> bool is
+    return jobs_send_signal(jt, id, "STOP")
+end
+
+;; Best-effort liveness check via `ps -p PID -o pid=` (see the module
+;; doc comment). Prints a Done/Killed-shaped line for anything no
+;; longer running and returns the updated (job removed) table.
+pub fn jobs_check_finished(mut jt: JobTable) -> JobTable is
+    let mut still_running: [Job] = []
+    let mut i = 0
+    while i < jt.jobs.len() is
+        let cur = i
+        i = i + 1
+        let j = jt.jobs[cur]
+        let out = proc::run("ps -p " + to_string(j.pid) + " -o pid= 2>/dev/null").trim()
+        if out == "" is
+            write("")
+            write("\x1b[1;32m[" + to_string(j.id) + "] Done\x1b[0m  " + j.command)
+        end
+        if out != "" is
+            still_running.push(j)
+        end
+    end
+    jt.jobs = still_running
+    return jt
+end
+
+pub fn jobs_count(jt: JobTable) -> int is
+    return jt.jobs.len()
+end
