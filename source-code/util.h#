@@ -1,0 +1,185 @@
+use "std -> env" from "env"
+
+;; `env::get` returns real `nil` (not `""`) for a variable that was
+;; never set at all in this OS process, contradicting its own doc
+;; comment ("Returns \"\" if unset") — confirmed by direct testing
+;; against this interpreter. Every call site in every hsh module goes
+;; through this wrapper instead of `env::get` directly.
+pub fn getenv_safe(name: string) -> string is
+    let v = env::get(name)
+    if v == nil is return "" end
+    return v
+end
+
+pub fn is_digit(c: string) -> bool is
+    return c >= "0" && c <= "9"
+end
+
+pub fn is_alpha(c: string) -> bool is
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "_"
+end
+
+pub fn is_alnum(c: string) -> bool is
+    return is_alpha(c) || is_digit(c)
+end
+
+pub fn is_ws(c: string) -> bool is
+    return c == " " || c == "\t"
+end
+
+;; true if `s` is non-empty and every character is a digit
+pub fn is_all_digits(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let mut i = 0
+    let mut ok = true
+    while i < s.len() is
+        let cur = i
+        i = i + 1
+        if !is_digit(s[cur..cur + 1]) is ok = false end
+    end
+    return ok
+end
+
+;; index of the first occurrence of a single-character token `stop`,
+;; starting the scan at `start`; -1 if not found before `n`.
+pub fn scan_until_char(s: string, start: int, n: int, stop: string) -> int is
+    let mut j = start
+    let mut going = true
+    let mut result = -1
+    while going is
+        if j >= n is
+            going = false
+        else is
+            if s[j..j + 1] == stop is
+                result = j
+                going = false
+            else is
+                j = j + 1
+            end
+        end
+    end
+    return result
+end
+
+;; index just past the identifier starting at `start` (letters/digits/
+;; underscore only).
+pub fn scan_ident_end(s: string, start: int, n: int) -> int is
+    let mut j = start
+    let mut going = true
+    while going is
+        if j >= n is
+            going = false
+        else is
+            if is_alnum(s[j..j + 1]) is
+                j = j + 1
+            else is
+                going = false
+            end
+        end
+    end
+    return j
+end
+
+;; index of the matching close-brace for the "{" at `open_idx`
+;; (handles nesting); -1 if unmatched before `n`.
+pub fn find_matching_brace(s: string, open_idx: int, n: int) -> int is
+    let mut depth = 0
+    let mut j = open_idx
+    let mut going = true
+    let mut result = -1
+    while going is
+        if j >= n is
+            going = false
+        else is
+            let c = s[j..j + 1]
+            if c == "{" is depth = depth + 1 end
+            if c == "}" is
+                depth = depth - 1
+                if depth == 0 is
+                    result = j
+                    going = false
+                end
+            end
+            if going is j = j + 1 end
+        end
+    end
+    return result
+end
+
+;; index of the matching close-paren for the "(" at `open_idx`
+;; (`open_idx` should point *after* the opening paren, i.e. depth
+;; already 1); -1 if unmatched before `n`.
+pub fn find_matching_paren(s: string, open_idx: int, n: int) -> int is
+    let mut depth = 1
+    let mut j = open_idx
+    let mut going = true
+    let mut result = -1
+    while going is
+        if j >= n is
+            going = false
+        else is
+            let c = s[j..j + 1]
+            if c == "(" is depth = depth + 1 end
+            if c == ")" is
+                depth = depth - 1
+                if depth == 0 is
+                    result = j
+                    going = false
+                end
+            end
+            if going is j = j + 1 end
+        end
+    end
+    return result
+end
+
+pub fn first_word(s: string) -> string is
+    let t = s.trim()
+    let sp = t.index_of(" ")
+    if sp < 0 is return t end
+    return t[0..sp]
+end
+
+pub fn rest_after_first_word(s: string) -> string is
+    let t = s.trim()
+    let sp = t.index_of(" ")
+    if sp < 0 is return "" end
+    return t[sp + 1..t.len()]
+end
+
+pub fn strip_quotes(s: string) -> string is
+    let t = s.trim()
+    if t.len() >= 2 is
+        if t.starts_with("\"") is
+            if t.ends_with("\"") is return t[1..t.len() - 1] end
+        end
+        if t.starts_with("'") is
+            if t.ends_with("'") is return t[1..t.len() - 1] end
+        end
+    end
+    return t
+end
+
+;; `write()` always appends its own newline; command output already
+;; ends in one (or several), so this trims exactly one trailing
+;; newline before printing to avoid a doubled blank line. Also skips
+;; printing anything at all for empty output — both checks live
+;; *inside* this helper (rather than at each call site) specifically
+;; so call sites can invoke it unconditionally: a call site of the
+;; shape `if out != "" is write_raw(out) end` followed by more code
+;; that reads a `mut` struct parameter is exactly the shape that hits
+;; a confirmed interpreter bug (see README.md's porting notes) — an
+;; `if` whose branch runs, immediately followed by any later use of a
+;; `mut` struct/hashmap parameter in the *same* function, can make
+;; that parameter read back as `nil`. Every place in this project that
+;; needs a conditional side effect right before returning/using a
+;; shell-state struct pushes the `if` down into a small helper like
+;; this one instead of guarding the call site.
+pub fn write_raw(s: string) is
+    if s == "" is return end
+    if s.ends_with("\n") is
+        write(s[0..s.len() - 1])
+    else is
+        write(s)
+    end
+end
