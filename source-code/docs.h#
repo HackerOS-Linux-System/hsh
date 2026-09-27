@@ -1,0 +1,82 @@
+pub fn docs_topics() -> [string] is
+    return ["variables", "expansion", "control-flow", "functions",
+            "builtins", "jobs", "config", "security", "themes"]
+end
+
+pub fn docs_show(topic: string) is
+    if topic == "variables" is
+        write("ZMIENNE")
+        write("  NAME=value               ustaw zmienną lokalną")
+        write("  export NAME=value        ustaw i eksportuj do środowiska")
+        write("  readonly NAME=value      ustaw zmienną tylko-do-odczytu")
+        write("  unset NAME               usuń zmienną")
+        write("  $NAME, $" + "{{NAME}}           odwołanie do wartości")
+        write("  $?  ostatni kod wyjścia    $$  PID powłoki   $0  nazwa skryptu")
+        return
+    end
+    if topic == "expansion" is
+        write("EKSPANSJA")
+        write("  $" + "{{NAME:-default}}   wartość NAME, lub 'default' jeśli puste/nieustawione")
+        write("  $" + "{{NAME:=default}}   jak wyżej (bez ustawiania NAME)")
+        write("  $" + "{{NAME:+alt}}       'alt' jeśli NAME jest ustawione i niepuste")
+        write("  $" + "{{#NAME}}           długość wartości NAME")
+        write("  $(polecenie)       podstawienie wyniku polecenia")
+        write("  `polecenie`        jak wyżej (stara składnia)")
+        write("  $((wyrażenie))     arytmetyka całkowita")
+        write("  ~  oraz  ~/ścieżka  ekspansja katalogu domowego")
+        return
+    end
+    if topic == "control-flow" is
+        write("STEROWANIE (w skryptach uruchamianych przez source/.)")
+        write("  if COND; then ... elif COND2; then ... else ... fi")
+        write("  while COND; do ... done")
+        write("  until COND; do ... done")
+        write("  for VAR in słowo1 słowo2 ...; do ... done")
+        write("  break, continue, return [kod]")
+        write("  COND to zwykłe polecenie — liczy się jego kod wyjścia (0 = prawda)")
+        return
+    end
+    if topic == "functions" is
+        write("FUNKCJE")
+        write("  function nazwa " + "{{ ... }}")
+        write("  nazwa() " + "{{ ... }}")
+        write("  $1, $2, ... — parametry pozycyjne; $# ich liczba")
+        write("  return [kod] kończy funkcję (nie cały skrypt)")
+        return
+    end
+    if topic == "builtins" is
+        write("WBUDOWANE POLECENIA — patrz: help")
+        return
+    end
+    if topic == "jobs" is
+        write("ZADANIA W TLE (best-effort — brak prawdziwej kontroli zadań, patrz README.md)")
+        write("  jobs             lista zadań")
+        write("  fg %N / bg %N    (nie przekazuje prawdziwie terminala)")
+        write("  stop %N          wysyła SIGSTOP")
+        write("  kill %N          wysyła SIGTERM")
+        write("  wait             sprawdza, które zadania się zakończyły")
+        return
+    end
+    if topic == "config" is
+        write("KONFIGURACJA — ~/.hshrc")
+        write("  Sekcje: [shell] [prompt] [aliases] [env] [completion] [safety] [scripts]")
+        write("  Format: key = \"value\"")
+        return
+    end
+    if topic == "security" is
+        write("BEZPIECZEŃSTWO")
+        write("  Niebezpieczne polecenia (rm -rf /, dd of=/dev/sdX, fork bomby, ...)")
+        write("  wymagają potwierdzenia przed wykonaniem.")
+        write("  hsh-audit sprawdza integralność dziennika audytu (~/.hsh-audit.log).")
+        return
+    end
+    if topic == "themes" is
+        write("MOTYWY")
+        write("  theme            pokaż aktualny motyw i listę dostępnych")
+        write("  theme NAZWA      zmień motyw")
+        return
+    end
+    write("Nieznany temat: " + topic)
+    write("Dostępne tematy: variables, expansion, control-flow, functions,")
+    write("                 builtins, jobs, config, security, themes")
+end
