@@ -1,0 +1,332 @@
+use "std -> conv"           from "conv"
+use "std -> env"            from "env"
+use "std -> process"        from "proc"
+mod util
+mod arithmetic
+;; ── ShellVars: variable storage + expansion ─────────────────────────────
+;; `vars`/`exported`/`readonly` are native `hashmap_new()` maps (name ->
+;; "1" for the latter two, used as membership sets). See the module doc
+;; comment for why not `std -> collections`.
+
+struct ShellVars is
+    pub vars: any
+    pub exported: any
+    pub readonly: any
+    pub last_exit: int
+    pub shell_pid: int
+    pub script_name: string
+    pub positional: [string]
+    pub opt_errexit: bool
+    pub opt_xtrace: bool
+    pub opt_nounset: bool
+end
+
+fn vars_new(shell_pid: int) -> ShellVars is
+    return ShellVars {
+        vars: hashmap_new(), exported: hashmap_new(), readonly: hashmap_new(),
+        last_exit: 0, shell_pid: shell_pid, script_name: "hsh",
+        positional: [], opt_errexit: false, opt_xtrace: false, opt_nounset: false,
+    }
+end
+
+;; Seed a handful of well-known variables from the real OS environment —
+;; `env::vars()` (list *everything*) is a documented no-op in H#'s
+;; current stdlib, so unlike a real shell we can't inherit the whole
+;; environment automatically; fetch the handful every shell cares about
+;; individually with `env::get`. Anything else the session/`.hshrc`
+;; explicitly sets still works normally.
+fn vars_seed_from_env(mut v: ShellVars) -> ShellVars is
+    let known = ["HOME", "PATH", "USER", "SHELL", "TERM", "LANG", "PWD",
+                 "OLDPWD", "EDITOR", "VISUAL", "HOSTNAME", "LOGNAME"]
+    let mut i = 0
+    while i < known.len() is
+        let cur = i
+        i = i + 1
+        let name = known[cur]
+        let val = util::getenv_safe(name)
+        if val != "" is
+            v.vars.insert(name, val)
+            v.exported.insert(name, "1")
+        end
+    end
+    return v
+end
+
+fn vars_get(v: ShellVars, name: string) -> string is
+    if name == "?" is return to_string(v.last_exit) end
+    if name == "$" is return to_string(v.shell_pid) end
+    if name == "0" is return v.script_name end
+    if name == "#" is return to_string(v.positional.len()) end
+    if name == "@" is return v.positional.join(" ") end
+    if name == "*" is return v.positional.join(" ") end
+    if util::is_all_digits(name) is
+        let idx = name.parse_int() - 1
+        if idx >= 0 is
+            if idx < v.positional.len() is return v.positional[idx] end
+        end
+        return ""
+    end
+    ;; BUG FIX (H-Sharp compiler side): was `v.vars.get(name)`. `.get(...)`
+    ;; method-call syntax is ambiguous between an array's `.get(index)`
+    ;; and a hashmap's `.get(key)` — nothing at codegen time knows which
+    ;; `v.vars` is (`any` is opaque by design), so this now calls the
+    ;; unambiguous native `map_get_str(map, key)` builtin directly
+    ;; instead. See H-Sharp's own PATCH_NOTES.md ("hashmap/hashset method
+    ;; call bridge") for the full story.
+    if v.vars.contains_key(name) is return map_get_str(v.vars, name) end
+    return util::getenv_safe(name)
+end
+
+fn vars_contains(v: ShellVars, name: string) -> bool is
+    if v.vars.contains_key(name) is return true end
+    return util::getenv_safe(name) != ""
+end
+
+;; Sets a variable. Silently refused if `name` is marked readonly
+;; (mirrors most shells' non-fatal behavior for this in an ordinary
+;; assignment context).
+fn vars_set(mut v: ShellVars, name: string, value: string) -> ShellVars is
+    if v.readonly.contains_key(name) is return v end
+    v.vars.insert(name, value)
+    if v.exported.contains_key(name) is
+        env::set(name, value)
+        return v
+    end
+    return v
+end
+
+fn vars_export(mut v: ShellVars, name: string, value: string) -> ShellVars is
+    v.vars.insert(name, value)
+    v.exported.insert(name, "1")
+    env::set(name, value)
+    return v
+end
+
+fn vars_unset(mut v: ShellVars, name: string) -> ShellVars is
+    if v.readonly.contains_key(name) is return v end
+    v.vars.remove(name)
+    v.exported.remove(name)
+    env::remove(name)
+    return v
+end
+
+;; ── tilde expansion ──────────────────────────────────────────────────────
+
+fn expand_tilde_word(v: ShellVars, s: string) -> string is
+    if s == "~" is return vars_get(v, "HOME") end
+    if s.starts_with("~/") is return vars_get(v, "HOME") + s[1..s.len()] end
+    return s
+end
+
+;; ── $VAR / ${VAR} / ${VAR:-default} / ${VAR:=default} expansion ─────────
+
+fn is_ident_start(c: string) -> bool is
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "_"
+end
+
+fn is_ident_char(c: string) -> bool is
+    return is_ident_start(c) || util::is_digit(c)
+end
+
+fn is_special_var_char(c: string) -> bool is
+    if c == "?" is return true end
+    if c == "$" is return true end
+    if c == "#" is return true end
+    if c == "@" is return true end
+    if c == "*" is return true end
+    return util::is_digit(c)
+end
+
+fn scan_ident(s: string, start: int, n: int) -> int is
+    let mut j = start
+    let mut going = true
+    while going is
+        if j >= n is
+            going = false
+        else is
+            if is_ident_char(s[j..j + 1]) is
+                j = j + 1
+            else is
+                going = false
+            end
+        end
+    end
+    return j
+end
+
+;; Handles `NAME`, `NAME:-default`, `NAME:=default`, `NAME:+alt`,
+;; `NAME:?msg`, and `#NAME` (length) inside `${ }`.
+fn expand_brace_body(v: ShellVars, body: string) -> string is
+    if body.starts_with("#") is
+        return to_string(vars_get(v, body[1..body.len()]).len())
+    end
+
+    let colon = body.index_of(":")
+    if colon < 0 is return vars_get(v, body) end
+
+    let name = body[0..colon]
+    let rest = body[colon + 1..body.len()]
+    let current = vars_get(v, name)
+
+    if rest.starts_with("-") is
+        if current == "" is return expand_vars(v, rest[1..rest.len()]) end
+        return current
+    end
+    if rest.starts_with("=") is
+        if current == "" is return expand_vars(v, rest[1..rest.len()]) end
+        return current
+    end
+    if rest.starts_with("+") is
+        if current != "" is return expand_vars(v, rest[1..rest.len()]) end
+        return ""
+    end
+    if rest.starts_with("?") is
+        return current
+    end
+    return current
+end
+
+;; Returns (expanded_text, index_after_the_$-expression).
+fn expand_one_var(v: ShellVars, s: string, start: int, n: int) -> (string, int) is
+    if start + 1 >= n is return ("$", start + 1) end
+    let c1 = s[start + 1..start + 2]
+
+    if c1 == "{" is
+        let close = util::find_matching_brace(s, start + 1, n)
+        if close < 0 is return ("$", start + 1) end
+        return (expand_brace_body(v, s[start + 2..close]), close + 1)
+    end
+
+    if is_special_var_char(c1) is return (vars_get(v, c1), start + 2) end
+
+    if is_ident_start(c1) is
+        let j = scan_ident(s, start + 1, n)
+        return (vars_get(v, s[start + 1..j]), j)
+    end
+
+    return ("$", start + 1)
+end
+
+;; Expands every `$VAR`/`${...}` reference in `input`. A literal `\$`
+;; passes both characters through unchanged (escape).
+fn expand_vars(v: ShellVars, input: string) -> string is
+    let mut result = ""
+    let n = input.len()
+    let mut i = 0
+    while i < n is
+        let c = input[i..i + 1]
+        if c == "$" is
+            let (piece, next_i) = expand_one_var(v, input, i, n)
+            result = result + piece
+            i = next_i
+        else is
+            if c == "\\" is
+                let mut two = false
+                if i + 1 < n is two = true end
+                if two is
+                    result = result + input[i..i + 2]
+                    i = i + 2
+                else is
+                    result = result + c
+                    i = i + 1
+                end
+            else is
+                result = result + c
+                i = i + 1
+            end
+        end
+    end
+    return result
+end
+
+;; ── $(...) / `...` command substitution ─────────────────────────────────
+;; See the module doc comment: this captures the inner command's
+;; buffered stdout via `process::run` — same "not live-streamed"
+;; caveat as everywhere else this port touches a subprocess.
+
+
+
+fn expand_command_subst(input: string) -> string is
+    let mut result = ""
+    let n = input.len()
+    let mut i = 0
+    while i < n is
+        let mut is_dollar_paren = false
+        if i + 1 < n is
+            if input[i..i + 1] == "$" is
+                if input[i + 1..i + 2] == "(" is
+                    let mut is_arith = false
+                    if i + 2 < n is
+                        if input[i + 2..i + 3] == "(" is is_arith = true end
+                    end
+                    if !is_arith is is_dollar_paren = true end
+                end
+            end
+        end
+        if is_dollar_paren is
+            let close = util::find_matching_paren(input, i + 2, n)
+            let end_idx = if close < 0 is n else close end
+            let out = proc::run(input[i + 2..end_idx]).trim_end()
+            result = result + out
+            i = if close < 0 is n else close + 1 end
+        else is
+            if input[i..i + 1] == "`" is
+                let close = util::scan_until_char(input, i + 1, n, "`")
+                let end_idx = if close < 0 is n else close end
+                let out = proc::run(input[i + 1..end_idx]).trim_end()
+                result = result + out
+                i = if close < 0 is n else close + 1 end
+            else is
+                result = result + input[i..i + 1]
+                i = i + 1
+            end
+        end
+    end
+    return result
+end
+
+;; Full expansion pipeline for one line: command substitution, then
+;; `$(( ))` arithmetic, then `$VAR`/`${VAR}` — this order matters (an
+;; arithmetic expr can reference a var set by an earlier `$(cmd)`, and
+;; a plain `$VAR` expansion must not eat the digits meant for `$((`).
+fn expand_line(v: ShellVars, input: string) -> string is
+    let after_cmd = expand_command_subst(input)
+    let after_arith = arithmetic::ar_expand(after_cmd, v.vars)
+    return expand_vars(v, after_arith)
+end
+
+;; ── Aliases ──────────────────────────────────────────────────────────────
+;; A thin native-hashmap wrapper — same `mut param -> return` discipline
+;; as ShellVars above.
+
+fn alias_set(mut aliases: any, name: string, value: string) -> any is
+    aliases.insert(name, value)
+    return aliases
+end
+
+fn alias_get(aliases: any, name: string) -> string is
+    ;; BUG FIX (H-Sharp compiler side): same `.get(...)` ambiguity as
+    ;; `vars_get` above — use the unambiguous `map_get_str(...)` builtin.
+    if aliases.contains_key(name) is return map_get_str(aliases, name) end
+    return ""
+end
+
+fn alias_remove(mut aliases: any, name: string) -> any is
+    aliases.remove(name)
+    return aliases
+end
+
+;; Expand a leading alias name in `line`, one level (no recursive
+;; alias-of-alias chasing, matching the original's own behavior for
+;; simplicity/safety against alias loops).
+fn expand_alias(aliases: any, line: string) -> string is
+    let trimmed = line.trim()
+    if trimmed == "" is return line end
+    let sp = trimmed.index_of(" ")
+    let first = if sp < 0 is trimmed else trimmed[0..sp] end
+    if !aliases.contains_key(first) is return line end
+    ;; BUG FIX (H-Sharp compiler side): same `.get(...)` ambiguity fix as above.
+    let replacement = map_get_str(aliases, first)
+    if sp < 0 is return replacement end
+    return replacement + trimmed[sp..trimmed.len()]
+end
