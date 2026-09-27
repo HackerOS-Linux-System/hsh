@@ -1,0 +1,76 @@
+use "std -> process" from "proc"
+mod util
+struct GitInfo is
+    pub branch: string    ;; "" means "not in a git repo / no branch"
+    pub dirty: bool
+    pub ahead: int
+    pub behind: int
+end
+
+fn git_short_hash() -> string is
+    let out = proc::run_args("git", ["rev-parse", "--short", "HEAD"]).trim()
+    if out.contains("fatal") is return "" end
+    return out
+end
+
+fn git_ahead_behind() -> (int, int) is
+    let out = proc::run_args("git", ["rev-list", "--left-right", "--count", "@" + "{{u}}...HEAD"]).trim()
+    if out == "" is return (0, 0) end
+    if out.contains("fatal") is return (0, 0) end
+    let parts = out.split(" ")
+    if parts.len() != 2 is return (0, 0) end
+    let mut behind = 0
+    let mut ahead = 0
+    if util::is_all_digits(parts[0]) is behind = parts[0].parse_int() end
+    if util::is_all_digits(parts[1]) is ahead = parts[1].parse_int() end
+    return (ahead, behind)
+end
+
+;; Fetches everything the prompt needs in one call. `GitInfo.branch ==
+;; ""` means "don't render a git segment at all" (not in a repo).
+pub fn git_fetch_info() -> GitInfo is
+    let branch_out = proc::run_args("git", ["rev-parse", "--abbrev-ref", "HEAD"]).trim()
+    let is_repo = !branch_out.contains("fatal") && !branch_out.contains("not a git repository") && branch_out != ""
+    if !is_repo is
+        return GitInfo { branch: "", dirty: false, ahead: 0, behind: 0 }
+    end
+
+    let mut branch = branch_out
+    if branch == "HEAD" is
+        ;; detached HEAD — show ":shorthash" like the original
+        let h = git_short_hash()
+        if h != "" is branch = ":" + h end
+    end
+
+    let dirty_out = proc::run_args("git", ["status", "--porcelain", "--untracked-files=no"]).trim()
+    let dirty = dirty_out != ""
+
+    let (ahead, behind) = git_ahead_behind()
+
+    return GitInfo { branch: branch, dirty: dirty, ahead: ahead, behind: behind }
+end
+
+;; Renders the `(symbol branch ✗ ↑2)`-shaped segment text (no leading/
+;; trailing space — the caller places it), or "" if not in a repo.
+;; `git_symbol` and `git_color` come from the active theme.
+pub fn git_format(info: GitInfo, git_symbol: string, git_color: string) -> string is
+    if info.branch == "" is return "" end
+
+    let mut dirty_marker = ""
+    if info.dirty is dirty_marker = " \x1b[31m\xe2\x9c\x97\x1b[0m" end
+
+    let mut sync = ""
+    if info.ahead > 0 is
+        if info.behind > 0 is
+            sync = " \x1b[33m\xe2\x86\x95" + to_string(info.ahead) + "/" + to_string(info.behind) + "\x1b[0m"
+        else is
+            sync = " \x1b[32m\xe2\x86\x91" + to_string(info.ahead) + "\x1b[0m"
+        end
+    else is
+        if info.behind > 0 is
+            sync = " \x1b[31m\xe2\x86\x93" + to_string(info.behind) + "\x1b[0m"
+        end
+    end
+
+    return git_color + "(" + git_symbol + " " + info.branch + dirty_marker + sync + ")\x1b[0m"
+end
