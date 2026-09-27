@@ -1,0 +1,533 @@
+struct Theme is
+    pub name: string
+    pub prompt_char: string
+    pub prompt_ok: string
+    pub prompt_err: string
+    pub dir_color: string
+    pub git_color: string
+    pub time_color: string
+    pub hint_color: string
+    pub cmd_ok_color: string
+    pub cmd_err_color: string
+    pub flag_color: string
+    pub string_color: string
+    pub var_color: string
+    pub op_color: string
+    pub path_color: string
+    pub sep: string
+    pub duration_color: string
+    pub error_color: string
+end
+
+pub fn theme_reset() -> string is
+    return "\x1b[0m"
+end
+
+pub fn theme_default() -> Theme is
+    return Theme {
+        name: "default",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;114m",
+        prompt_err: "\x1b[38;5;203m",
+        dir_color: "\x1b[38;5;110m",
+        git_color: "\x1b[38;5;179m",
+        time_color: "\x1b[38;5;242m",
+        hint_color: "\x1b[38;5;236m",
+        cmd_ok_color: "\x1b[38;5;114m",
+        cmd_err_color: "\x1b[38;5;203m",
+        flag_color: "\x1b[38;5;179m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;110m",
+        op_color: "\x1b[38;5;242m",
+        path_color: "\x1b[38;5;73m",
+        sep: "\x1b[38;5;238m\x1b[0m",
+        duration_color: "\x1b[38;5;242m",
+        error_color: "\x1b[38;5;203m",
+    }
+end
+
+pub fn theme_cosmic() -> Theme is
+    return Theme {
+        name: "cosmic",
+        prompt_char: "⟩",
+        prompt_ok: "\x1b[38;5;51m",
+        prompt_err: "\x1b[38;5;213m",
+        dir_color: "\x1b[38;5;141m",
+        git_color: "\x1b[38;5;51m",
+        time_color: "\x1b[38;5;105m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;51m",
+        cmd_err_color: "\x1b[38;5;213m",
+        flag_color: "\x1b[38;5;228m",
+        string_color: "\x1b[38;5;213m",
+        var_color: "\x1b[38;5;123m",
+        op_color: "\x1b[38;5;141m",
+        path_color: "\x1b[38;5;87m",
+        sep: "\x1b[38;5;57m\x1b[0m",
+        duration_color: "\x1b[38;5;105m",
+        error_color: "\x1b[38;5;213m",
+    }
+end
+
+pub fn theme_nord() -> Theme is
+    return Theme {
+        name: "nord",
+        prompt_char: "→",
+        prompt_ok: "\x1b[38;5;109m",
+        prompt_err: "\x1b[38;5;167m",
+        dir_color: "\x1b[38;5;117m",
+        git_color: "\x1b[38;5;143m",
+        time_color: "\x1b[38;5;103m",
+        hint_color: "\x1b[38;5;239m",
+        cmd_ok_color: "\x1b[38;5;109m",
+        cmd_err_color: "\x1b[38;5;167m",
+        flag_color: "\x1b[38;5;143m",
+        string_color: "\x1b[38;5;108m",
+        var_color: "\x1b[38;5;153m",
+        op_color: "\x1b[38;5;103m",
+        path_color: "\x1b[38;5;116m",
+        sep: "\x1b[38;5;238m\x1b[0m",
+        duration_color: "\x1b[38;5;103m",
+        error_color: "\x1b[38;5;167m",
+    }
+end
+
+pub fn theme_gruvbox() -> Theme is
+    return Theme {
+        name: "gruvbox",
+        prompt_char: "▸",
+        prompt_ok: "\x1b[38;5;142m",
+        prompt_err: "\x1b[38;5;167m",
+        dir_color: "\x1b[38;5;214m",
+        git_color: "\x1b[38;5;108m",
+        time_color: "\x1b[38;5;243m",
+        hint_color: "\x1b[38;5;239m",
+        cmd_ok_color: "\x1b[38;5;142m",
+        cmd_err_color: "\x1b[38;5;167m",
+        flag_color: "\x1b[38;5;214m",
+        string_color: "\x1b[38;5;108m",
+        var_color: "\x1b[38;5;214m",
+        op_color: "\x1b[38;5;243m",
+        path_color: "\x1b[38;5;108m",
+        sep: "\x1b[38;5;239m\x1b[0m",
+        duration_color: "\x1b[38;5;243m",
+        error_color: "\x1b[38;5;167m",
+    }
+end
+
+pub fn theme_dracula() -> Theme is
+    return Theme {
+        name: "dracula",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;84m",
+        prompt_err: "\x1b[38;5;203m",
+        dir_color: "\x1b[38;5;183m",
+        git_color: "\x1b[38;5;159m",
+        time_color: "\x1b[38;5;102m",
+        hint_color: "\x1b[38;5;238m",
+        cmd_ok_color: "\x1b[38;5;84m",
+        cmd_err_color: "\x1b[38;5;203m",
+        flag_color: "\x1b[38;5;228m",
+        string_color: "\x1b[38;5;228m",
+        var_color: "\x1b[38;5;183m",
+        op_color: "\x1b[38;5;212m",
+        path_color: "\x1b[38;5;159m",
+        sep: "\x1b[38;5;61m\x1b[0m",
+        duration_color: "\x1b[38;5;102m",
+        error_color: "\x1b[38;5;203m",
+    }
+end
+
+pub fn theme_hackeros() -> Theme is
+    return Theme {
+        name: "hackeros",
+        prompt_char: "#",
+        prompt_ok: "\x1b[38;5;46m",
+        prompt_err: "\x1b[38;5;196m",
+        dir_color: "\x1b[38;5;40m",
+        git_color: "\x1b[38;5;34m",
+        time_color: "\x1b[38;5;28m",
+        hint_color: "\x1b[38;5;22m",
+        cmd_ok_color: "\x1b[38;5;46m",
+        cmd_err_color: "\x1b[38;5;196m",
+        flag_color: "\x1b[38;5;118m",
+        string_color: "\x1b[38;5;82m",
+        var_color: "\x1b[38;5;154m",
+        op_color: "\x1b[38;5;40m",
+        path_color: "\x1b[38;5;76m",
+        sep: "\x1b[38;5;22m\x1b[0m",
+        duration_color: "\x1b[38;5;28m",
+        error_color: "\x1b[38;5;196m",
+    }
+end
+
+pub fn theme_solarized_light() -> Theme is
+    return Theme {
+        name: "solarized-light",
+        prompt_char: "➤",
+        prompt_ok: "\x1b[38;5;108m",
+        prompt_err: "\x1b[38;5;160m",
+        dir_color: "\x1b[38;5;33m",
+        git_color: "\x1b[38;5;136m",
+        time_color: "\x1b[38;5;102m",
+        hint_color: "\x1b[38;5;250m",
+        cmd_ok_color: "\x1b[38;5;108m",
+        cmd_err_color: "\x1b[38;5;160m",
+        flag_color: "\x1b[38;5;136m",
+        string_color: "\x1b[38;5;142m",
+        var_color: "\x1b[38;5;33m",
+        op_color: "\x1b[38;5;240m",
+        path_color: "\x1b[38;5;66m",
+        sep: "\x1b[38;5;248m\x1b[0m",
+        duration_color: "\x1b[38;5;102m",
+        error_color: "\x1b[38;5;160m",
+    }
+end
+
+pub fn theme_solarized_dark() -> Theme is
+    return Theme {
+        name: "solarized-dark",
+        prompt_char: "➤",
+        prompt_ok: "\x1b[38;5;108m",
+        prompt_err: "\x1b[38;5;160m",
+        dir_color: "\x1b[38;5;33m",
+        git_color: "\x1b[38;5;136m",
+        time_color: "\x1b[38;5;102m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;108m",
+        cmd_err_color: "\x1b[38;5;160m",
+        flag_color: "\x1b[38;5;136m",
+        string_color: "\x1b[38;5;142m",
+        var_color: "\x1b[38;5;33m",
+        op_color: "\x1b[38;5;245m",
+        path_color: "\x1b[38;5;66m",
+        sep: "\x1b[38;5;236m\x1b[0m",
+        duration_color: "\x1b[38;5;102m",
+        error_color: "\x1b[38;5;160m",
+    }
+end
+
+pub fn theme_tomorrow_night() -> Theme is
+    return Theme {
+        name: "tomorrow-night",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;114m",
+        prompt_err: "\x1b[38;5;203m",
+        dir_color: "\x1b[38;5;111m",
+        git_color: "\x1b[38;5;185m",
+        time_color: "\x1b[38;5;244m",
+        hint_color: "\x1b[38;5;236m",
+        cmd_ok_color: "\x1b[38;5;114m",
+        cmd_err_color: "\x1b[38;5;203m",
+        flag_color: "\x1b[38;5;185m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;111m",
+        op_color: "\x1b[38;5;242m",
+        path_color: "\x1b[38;5;110m",
+        sep: "\x1b[38;5;238m\x1b[0m",
+        duration_color: "\x1b[38;5;242m",
+        error_color: "\x1b[38;5;203m",
+    }
+end
+
+pub fn theme_monokai() -> Theme is
+    return Theme {
+        name: "monokai",
+        prompt_char: "»",
+        prompt_ok: "\x1b[38;5;148m",
+        prompt_err: "\x1b[38;5;197m",
+        dir_color: "\x1b[38;5;81m",
+        git_color: "\x1b[38;5;185m",
+        time_color: "\x1b[38;5;245m",
+        hint_color: "\x1b[38;5;238m",
+        cmd_ok_color: "\x1b[38;5;148m",
+        cmd_err_color: "\x1b[38;5;197m",
+        flag_color: "\x1b[38;5;185m",
+        string_color: "\x1b[38;5;148m",
+        var_color: "\x1b[38;5;81m",
+        op_color: "\x1b[38;5;246m",
+        path_color: "\x1b[38;5;141m",
+        sep: "\x1b[38;5;237m\x1b[0m",
+        duration_color: "\x1b[38;5;245m",
+        error_color: "\x1b[38;5;197m",
+    }
+end
+
+pub fn theme_ayu_dark() -> Theme is
+    return Theme {
+        name: "ayu-dark",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;150m",
+        prompt_err: "\x1b[38;5;210m",
+        dir_color: "\x1b[38;5;111m",
+        git_color: "\x1b[38;5;179m",
+        time_color: "\x1b[38;5;243m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;150m",
+        cmd_err_color: "\x1b[38;5;210m",
+        flag_color: "\x1b[38;5;179m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;111m",
+        op_color: "\x1b[38;5;245m",
+        path_color: "\x1b[38;5;146m",
+        sep: "\x1b[38;5;238m\x1b[0m",
+        duration_color: "\x1b[38;5;243m",
+        error_color: "\x1b[38;5;210m",
+    }
+end
+
+pub fn theme_ayu_light() -> Theme is
+    return Theme {
+        name: "ayu-light",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;142m",
+        prompt_err: "\x1b[38;5;160m",
+        dir_color: "\x1b[38;5;32m",
+        git_color: "\x1b[38;5;136m",
+        time_color: "\x1b[38;5;102m",
+        hint_color: "\x1b[38;5;248m",
+        cmd_ok_color: "\x1b[38;5;142m",
+        cmd_err_color: "\x1b[38;5;160m",
+        flag_color: "\x1b[38;5;136m",
+        string_color: "\x1b[38;5;142m",
+        var_color: "\x1b[38;5;32m",
+        op_color: "\x1b[38;5;243m",
+        path_color: "\x1b[38;5;66m",
+        sep: "\x1b[38;5;250m\x1b[0m",
+        duration_color: "\x1b[38;5;102m",
+        error_color: "\x1b[38;5;160m",
+    }
+end
+
+pub fn theme_one_dark() -> Theme is
+    return Theme {
+        name: "one-dark",
+        prompt_char: "$",
+        prompt_ok: "\x1b[38;5;114m",
+        prompt_err: "\x1b[38;5;203m",
+        dir_color: "\x1b[38;5;110m",
+        git_color: "\x1b[38;5;179m",
+        time_color: "\x1b[38;5;242m",
+        hint_color: "\x1b[38;5;236m",
+        cmd_ok_color: "\x1b[38;5;114m",
+        cmd_err_color: "\x1b[38;5;203m",
+        flag_color: "\x1b[38;5;179m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;110m",
+        op_color: "\x1b[38;5;242m",
+        path_color: "\x1b[38;5;73m",
+        sep: "\x1b[38;5;238m\x1b[0m",
+        duration_color: "\x1b[38;5;242m",
+        error_color: "\x1b[38;5;203m",
+    }
+end
+
+pub fn theme_catppuccin_mocha() -> Theme is
+    return Theme {
+        name: "catppuccin-mocha",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;84m",
+        prompt_err: "\x1b[38;5;210m",
+        dir_color: "\x1b[38;5;111m",
+        git_color: "\x1b[38;5;216m",
+        time_color: "\x1b[38;5;245m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;84m",
+        cmd_err_color: "\x1b[38;5;210m",
+        flag_color: "\x1b[38;5;216m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;111m",
+        op_color: "\x1b[38;5;243m",
+        path_color: "\x1b[38;5;147m",
+        sep: "\x1b[38;5;236m\x1b[0m",
+        duration_color: "\x1b[38;5;245m",
+        error_color: "\x1b[38;5;210m",
+    }
+end
+
+pub fn theme_everforest() -> Theme is
+    return Theme {
+        name: "everforest",
+        prompt_char: "➜",
+        prompt_ok: "\x1b[38;5;108m",
+        prompt_err: "\x1b[38;5;167m",
+        dir_color: "\x1b[38;5;109m",
+        git_color: "\x1b[38;5;142m",
+        time_color: "\x1b[38;5;245m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;108m",
+        cmd_err_color: "\x1b[38;5;167m",
+        flag_color: "\x1b[38;5;142m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;109m",
+        op_color: "\x1b[38;5;245m",
+        path_color: "\x1b[38;5;109m",
+        sep: "\x1b[38;5;236m\x1b[0m",
+        duration_color: "\x1b[38;5;245m",
+        error_color: "\x1b[38;5;167m",
+    }
+end
+
+pub fn theme_tokyo_night() -> Theme is
+    return Theme {
+        name: "tokyo-night",
+        prompt_char: "❯",
+        prompt_ok: "\x1b[38;5;114m",
+        prompt_err: "\x1b[38;5;203m",
+        dir_color: "\x1b[38;5;111m",
+        git_color: "\x1b[38;5;179m",
+        time_color: "\x1b[38;5;245m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;114m",
+        cmd_err_color: "\x1b[38;5;203m",
+        flag_color: "\x1b[38;5;179m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;111m",
+        op_color: "\x1b[38;5;242m",
+        path_color: "\x1b[38;5;146m",
+        sep: "\x1b[38;5;236m\x1b[0m",
+        duration_color: "\x1b[38;5;245m",
+        error_color: "\x1b[38;5;203m",
+    }
+end
+
+pub fn theme_kanagawa() -> Theme is
+    return Theme {
+        name: "kanagawa",
+        prompt_char: "λ",
+        prompt_ok: "\x1b[38;5;150m",
+        prompt_err: "\x1b[38;5;210m",
+        dir_color: "\x1b[38;5;110m",
+        git_color: "\x1b[38;5;179m",
+        time_color: "\x1b[38;5;245m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;150m",
+        cmd_err_color: "\x1b[38;5;210m",
+        flag_color: "\x1b[38;5;179m",
+        string_color: "\x1b[38;5;150m",
+        var_color: "\x1b[38;5;110m",
+        op_color: "\x1b[38;5;243m",
+        path_color: "\x1b[38;5;146m",
+        sep: "\x1b[38;5;236m\x1b[0m",
+        duration_color: "\x1b[38;5;245m",
+        error_color: "\x1b[38;5;210m",
+    }
+end
+
+pub fn theme_rose_pine() -> Theme is
+    return Theme {
+        name: "rose-pine",
+        prompt_char: "🌹",
+        prompt_ok: "\x1b[38;5;211m",
+        prompt_err: "\x1b[38;5;203m",
+        dir_color: "\x1b[38;5;183m",
+        git_color: "\x1b[38;5;216m",
+        time_color: "\x1b[38;5;247m",
+        hint_color: "\x1b[38;5;237m",
+        cmd_ok_color: "\x1b[38;5;211m",
+        cmd_err_color: "\x1b[38;5;203m",
+        flag_color: "\x1b[38;5;216m",
+        string_color: "\x1b[38;5;217m",
+        var_color: "\x1b[38;5;183m",
+        op_color: "\x1b[38;5;245m",
+        path_color: "\x1b[38;5;147m",
+        sep: "\x1b[38;5;236m\x1b[0m",
+        duration_color: "\x1b[38;5;247m",
+        error_color: "\x1b[38;5;203m",
+    }
+end
+
+pub fn theme_cyberpunk() -> Theme is
+    return Theme {
+        name: "cyberpunk",
+        prompt_char: "⚡",
+        prompt_ok: "\x1b[38;5;201m",
+        prompt_err: "\x1b[38;5;198m",
+        dir_color: "\x1b[38;5;51m",
+        git_color: "\x1b[38;5;201m",
+        time_color: "\x1b[38;5;129m",
+        hint_color: "\x1b[38;5;235m",
+        cmd_ok_color: "\x1b[38;5;51m",
+        cmd_err_color: "\x1b[38;5;198m",
+        flag_color: "\x1b[38;5;201m",
+        string_color: "\x1b[38;5;213m",
+        var_color: "\x1b[38;5;51m",
+        op_color: "\x1b[38;5;201m",
+        path_color: "\x1b[38;5;87m",
+        sep: "\x1b[38;5;57m\x1b[0m",
+        duration_color: "\x1b[38;5;129m",
+        error_color: "\x1b[38;5;198m",
+    }
+end
+
+pub fn theme_nord_light() -> Theme is
+    return Theme {
+        name: "nord-light",
+        prompt_char: "→",
+        prompt_ok: "\x1b[38;5;108m",
+        prompt_err: "\x1b[38;5;167m",
+        dir_color: "\x1b[38;5;66m",
+        git_color: "\x1b[38;5;136m",
+        time_color: "\x1b[38;5;102m",
+        hint_color: "\x1b[38;5;250m",
+        cmd_ok_color: "\x1b[38;5;108m",
+        cmd_err_color: "\x1b[38;5;167m",
+        flag_color: "\x1b[38;5;136m",
+        string_color: "\x1b[38;5;108m",
+        var_color: "\x1b[38;5;66m",
+        op_color: "\x1b[38;5;245m",
+        path_color: "\x1b[38;5;66m",
+        sep: "\x1b[38;5;250m\x1b[0m",
+        duration_color: "\x1b[38;5;102m",
+        error_color: "\x1b[38;5;167m",
+    }
+end
+
+pub fn theme_names() -> [string] is
+    return [
+        "default",
+        "cosmic",
+        "nord",
+        "gruvbox",
+        "dracula",
+        "hackeros",
+        "solarized-light",
+        "solarized-dark",
+        "tomorrow-night",
+        "monokai",
+        "ayu-dark",
+        "ayu-light",
+        "one-dark",
+        "catppuccin-mocha",
+        "everforest",
+        "tokyo-night",
+        "kanagawa",
+        "rose-pine",
+        "cyberpunk",
+        "nord-light",
+    ]
+end
+
+pub fn theme_by_name(name: string) -> Theme is
+    if name == "default" is return theme_default() end
+    if name == "cosmic" is return theme_cosmic() end
+    if name == "nord" is return theme_nord() end
+    if name == "gruvbox" is return theme_gruvbox() end
+    if name == "dracula" is return theme_dracula() end
+    if name == "hackeros" is return theme_hackeros() end
+    if name == "solarized-light" is return theme_solarized_light() end
+    if name == "solarized-dark" is return theme_solarized_dark() end
+    if name == "tomorrow-night" is return theme_tomorrow_night() end
+    if name == "monokai" is return theme_monokai() end
+    if name == "ayu-dark" is return theme_ayu_dark() end
+    if name == "ayu-light" is return theme_ayu_light() end
+    if name == "one-dark" is return theme_one_dark() end
+    if name == "catppuccin-mocha" is return theme_catppuccin_mocha() end
+    if name == "everforest" is return theme_everforest() end
+    if name == "tokyo-night" is return theme_tokyo_night() end
+    if name == "kanagawa" is return theme_kanagawa() end
+    if name == "rose-pine" is return theme_rose_pine() end
+    if name == "cyberpunk" is return theme_cyberpunk() end
+    if name == "nord-light" is return theme_nord_light() end
+    return theme_default()   ;; fallback: default
+end
