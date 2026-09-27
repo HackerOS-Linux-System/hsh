@@ -1,4 +1,4 @@
-# hsh (H# port) — multi-file, ~1:1 with the original
+# hsh
 
 A from-scratch, multi-file port of `hsh` (a shell for HackerOS) from
 Rust to H#, matching the original's own file layout where a matching
