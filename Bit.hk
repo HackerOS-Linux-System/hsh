@@ -1,14 +1,24 @@
 [package]
--> name    => hsh
--> version => 0.5.0
--> description => hsh — a shell for HackerOS.
--> license => BSD-3
+-> name        => hsh
+-> version     => 0.6.0
+-> description => hsh — a shell for HackerOS (live suggestions, highlighting and Tab completion via hprompt).
+-> license     => BSD-3
+-> lang        => h#
+
+[layout]
+-> src => source-code
+
+[edition]
+-> edition   => 2026
+-> toolchain => 0.9
 
 [build]
--> lang   => h#
--> entry  => source-code/main.h#
--> output => build/hsh
--> emit   => bin
+-> link => static
 
-[deps]
+[default-build]
+-> profile => release
+-> emit    => bin
+
+! newest hprompt from the bit index (>= 0.2 has the live line editor)
+[dependencies]
 -> hprompt => newest
