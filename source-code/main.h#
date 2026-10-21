@@ -1,4 +1,4 @@
-use "bytes -> hprompt" from "hp"
+use "bit -> hprompt" from "hp"
 use "std -> fs"              from "fs"
 use "std -> io"               from "io"
 use "std -> process"           from "proc"
@@ -128,6 +128,11 @@ fn main() is
     ed = hp::editor_set_tab_complete(ed, true)
     let (ed1, _loaded) = hp::editor_load_history(ed, hprompt_history_path())
     ed = ed1
+    ;; live editor (hprompt >= 0.2): suggestions, highlighting, Tab menu
+    ed = hp::editor_set_live(ed, true)
+    ed = hp::editor_set_suggest(ed, true)
+    ed = hp::editor_set_highlight(ed, true)
+    let mut words_sig = words_signature(sh.aliases, pcache)
 
     write("hsh (port H#) — wpisz 'help' po listę poleceń, 'exit' aby wyjść.")
 
@@ -139,6 +144,11 @@ fn main() is
         let theme = theme::theme_by_name(sh.theme_name)
         let prompt_text = prompt::build_prompt(cwd, home, sh.v.last_exit, sh.last_duration_ms,
                                             sh.shell_depth, git, theme)
+
+        ;; keep Tab completion / highlighting in sync with new aliases and PATH
+        let (ed_r, sig_r) = refresh_words(ed, sh.aliases, pcache, words_sig)
+        ed = ed_r
+        words_sig = sig_r
 
         let (ed2, first_result) = hp::editor_readline_with(ed, prompt_text)
         ed = ed2
@@ -185,6 +195,7 @@ fn main() is
 
             if cmd_for_history != "" is
                 rich_hist = history::rich_history_add(rich_hist, cmd_for_history, now_ts())
+                hp::editor_append_history(ed, hprompt_history_path(), cmd_for_history)
             end
             if !sh.running is keep_going = false end
         end
@@ -192,6 +203,18 @@ fn main() is
 
     hp::editor_save_history(ed, hprompt_history_path())
     rich_hist = history::rich_history_save(rich_hist)
+end
+
+;; Cheap fingerprint of "what could be a command": alias count + PATH commands.
+fn words_signature(aliases: any, pc: path_cache::PathCache) -> int is
+    return aliases.keys().len() * 1000003 + pc.commands.len()
+end
+
+fn refresh_words(ed: any, aliases: any, pc: path_cache::PathCache, sig: int) -> (any, int) is
+    let now = words_signature(aliases, pc)
+    if now == sig is return (ed, sig) end
+    let words = helper::build_completion_words(aliases, pc)
+    return (hp::editor_set_completer(ed, hp::completer_from_words(words)), now)
 end
 
 ;; The shell's own PID (for `$$`), fetched via `sh -c 'echo $$'` since
